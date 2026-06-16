@@ -11,14 +11,17 @@ llm:
   max_tokens: 16384
   reasoning_effort: "medium"  # For reasoning models (o1, etc.)
 
+# embedding:
+#   # HuggingFace model name or local model path
+#   # We use Qwen3-Embedding-0.6B in our paper
+#   model: "Qwen/Qwen3-Embedding-0.6B"
+#   # model: "/path/to/local/Qwen3-Embedding-0.6B"
+#   device: "cuda:0"  # or "cpu"
+#   batch_size: 16
 embedding:
-  # HuggingFace model name or local model path
-  # We use Qwen3-Embedding-0.6B in our paper
-  model: "Qwen/Qwen3-Embedding-0.6B"
-  # model: "/path/to/local/Qwen3-Embedding-0.6B"
-  device: "cuda:0"  # or "cpu"
+  model: "/home/qiu.yc/.cache/huggingface/hub/models--Qwen--Qwen3-Embedding-0.6B/snapshots/97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3"
+  device: "cuda:0"
   batch_size: 16
-
 agent:
   max_loops: 15
   max_token_budget: 128000
