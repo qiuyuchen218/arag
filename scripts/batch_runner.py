@@ -23,6 +23,7 @@ from arag import LLMClient, BaseAgent, ToolRegistry, Config
 from arag.tools.keyword_search import KeywordSearchTool
 from arag.tools.semantic_search import SemanticSearchTool
 from arag.tools.read_chunk import ReadChunkTool
+from arag.utils.trace_graph import TraceGraph
 
 logging.basicConfig(level=logging.ERROR)
 
@@ -48,6 +49,9 @@ class BatchRunner:
         self.verbose = verbose
 
         self.predictions_file = self.output_dir / "predictions.jsonl"
+        self.dataset_name = self.questions_file.stem
+        self.trace_dir = self.output_dir / "traces" / self.dataset_name
+        self.trace_html_dir = self.output_dir / "trace_html" / self.dataset_name
         self.write_lock = Lock()
 
         self.questions = self._load_questions()
@@ -149,14 +153,66 @@ class BatchRunner:
             verbose=self.verbose
         )
 
-    def _process_one(self, item: Dict[str, Any], agent: BaseAgent) -> Dict[str, Any]:
+    @staticmethod
+    def _safe_path_part(value: Any) -> str:
+        text = str(value) if value is not None else "unknown"
+        safe = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in text)
+        return safe[:120] or "unknown"
+
+    def _process_one(
+        self,
+        item: Dict[str, Any],
+        agent: BaseAgent,
+        sample_index: int = 0,
+    ) -> Dict[str, Any]:
         """Process one question."""
         qid = item.get('qid') or item.get('id')
+        sample_id = qid if qid is not None else f"sample_{sample_index:06d}"
+        safe_sample_id = self._safe_path_part(sample_id)
+
         question = item.get('question', '')
         gold_answer = item.get('answer', item.get('gold_answer', ''))
 
+        trace_logger = TraceGraph(
+            sample_id=str(sample_id),
+            dataset=self.dataset_name,
+            metadata={
+                "qid": qid,
+                "sample_index": sample_index,
+                "questions_file": str(self.questions_file),
+                "gold_answer": gold_answer,
+                "formal_path": "question -> plan_query -> retriever_call -> retrieved_chunk -> llm_call -> claim -> answer",
+            },
+        )
+
+        question_node = trace_logger.add_node(
+            "question",
+            content=question,
+            metadata={
+                "qid": qid,
+                "sample_index": sample_index,
+                "dataset": self.dataset_name,
+            },
+        )
+        trace_logger.add_temporal_next(question_node)
+
+        trace_path = self.trace_dir / f"{safe_sample_id}.json"
+        trace_html_path = self.trace_html_dir / f"{safe_sample_id}.html"
+
         try:
-            result = agent.run(question)
+            result = agent.run(question, trace_logger=trace_logger)
+            trace_logger.metadata.update({
+                "final_answer": result.get("answer", ""),
+                "pred_answer": result.get("answer", ""),
+                "gold_answer": gold_answer,
+                "termination_reason": result.get("termination_reason", ""),
+                "total_cost": result.get("total_cost", 0),
+                "loops": result.get("loops", 0),
+                "total_retrieved_tokens": result.get("total_retrieved_tokens", 0),
+                "raw_error": result.get("raw_error"),
+            })
+            trace_logger.save_json(trace_path)
+            trace_logger.save_html(trace_html_path)
 
             return {
                 'qid': qid,
@@ -174,15 +230,31 @@ class BatchRunner:
                 'search_history': result.get('search_history', []),
                 'message_trace': result.get('message_trace', []),
                 'final_messages': result.get('final_messages', []),
-                'termination_reason': result.get('termination_reason', '')
+                'termination_reason': result.get('termination_reason', ''),
+                'trace_path': str(trace_path),
+                'trace_html_path': str(trace_html_path),
             }
         except Exception as e:
+            error_answer = f"Error: {str(e)}"
+            parent = trace_logger.latest_node_id("llm_call") or question_node
+            trace_logger.add_error(parent, e, "batch_runner", 0, "error")
+            trace_logger.add_answer(None, "", 0, "error", failed=True, raw_error=str(e))
+            trace_logger.metadata.update({
+                "final_answer": "",
+                "pred_answer": error_answer,
+                "gold_answer": gold_answer,
+                "termination_reason": "error",
+                "error": str(e),
+            })
+            trace_logger.save_json(trace_path)
+            trace_logger.save_html(trace_html_path)
+
             return {
                 'qid': qid,
                 'question': question,
                 'trajectory': [],
                 'gold_answer': gold_answer,
-                'pred_answer': f"Error: {str(e)}",
+                'pred_answer': error_answer,
                 'total_cost': 0,
                 'loops': 0,
                 'total_retrieved_tokens': 0,
@@ -194,7 +266,9 @@ class BatchRunner:
                 'message_trace': [],
                 'final_messages': [],
                 'termination_reason': 'error',
-                'error': str(e)
+                'error': str(e),
+                'trace_path': str(trace_path),
+                'trace_html_path': str(trace_html_path),
             }
 
     def run(self):
@@ -217,9 +291,9 @@ class BatchRunner:
         with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
             futures = {}
 
-            for item in pending:
+            for sample_index, item in enumerate(pending):
                 agent = self._create_agent()
-                future = executor.submit(self._process_one, item, agent)
+                future = executor.submit(self._process_one, item, agent, sample_index)
                 futures[future] = item.get('qid') or item.get('id')
 
             with tqdm(total=len(pending), desc="Processing") as pbar:
@@ -233,6 +307,8 @@ class BatchRunner:
                     pbar.update(1)
 
         print(f"\nResults saved to: {self.predictions_file}")
+        print(f"Trace JSON saved under: {self.trace_dir}")
+        print(f"Trace HTML saved under: {self.trace_html_dir}")
 
 
 def main():

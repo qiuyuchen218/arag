@@ -8,13 +8,16 @@ from arag.core.llm import LLMClient
 from arag.agent.base import BaseAgent
 from arag.tools.base import BaseTool
 from arag.tools.registry import ToolRegistry
+from arag.utils.trace_graph import TraceGraph, TraceLogger
 
 __all__ = [
     "Config",
-    "AgentContext", 
+    "AgentContext",
     "LLMClient",
     "BaseAgent",
     "BaseTool",
     "ToolRegistry",
+    "TraceGraph",
+    "TraceLogger",
     "__version__",
 ]
