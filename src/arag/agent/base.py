@@ -90,15 +90,10 @@ class BaseAgent:
     def _trace_question(self, trace_logger: Any, query: str) -> str:
         if trace_logger is None:
             return None
-        question_node = trace_logger.latest_node_id("question")
-        if question_node is None:
-            question_node = trace_logger.add_node(
-                "question",
-                content=query,
-                metadata={"role": "user_input"},
-            )
-            trace_logger.add_temporal_next(question_node)
-        return question_node
+        try:
+            return trace_logger.add_question(query, {"role": "user_input"})
+        except Exception:
+            return None
 
     def _trace_llm_analysis(
         self,
@@ -113,40 +108,28 @@ class BaseAgent:
     ) -> str:
         if trace_logger is None:
             return None
-
-        analysis_node = trace_logger.add_node(
-            "llm_call",
-            content=f"model={getattr(self.llm, 'model', None)}; loop={loop_count}",
-            metadata={
-                "loop": loop_count,
-                "model": getattr(self.llm, "model", None),
-                "temperature": getattr(self.llm, "temperature", None),
-                "max_tokens": getattr(self.llm, "max_tokens", None),
-                "input_tokens": response.get("input_tokens", 0) if response else 0,
-                "output_tokens": response.get("output_tokens", 0) if response else 0,
-                "cost": response.get("cost", 0) if response else 0,
-                "tool_calls": message.get("tool_calls", []),
-                "forced": forced,
-                "reason": reason,
-                "prompt_preview": "",
-                "response_preview": self._preview(message.get("content", "")),
-            },
-        )
-
-        if evidence_nodes:
-            for evidence_node in evidence_nodes:
-                trace_logger.add_edge(evidence_node, analysis_node, "used_as_context", {
-                    "loop": loop_count, "context_order": evidence_nodes.index(evidence_node) + 1,
-                    "timestamp": trace_logger._utc_now(),
-                })
-        elif question_node:
-            trace_logger.add_edge(question_node, analysis_node, "calls", {
-                "loop": loop_count, "call_order": loop_count, "timestamp": trace_logger._utc_now(),
+        try:
+            analysis_node = trace_logger.add_llm_call(
+                model=getattr(self.llm, "model", None),
+                loop=loop_count,
+                message=message,
+                response=response,
+                forced=forced,
+                reason=reason,
+                metadata={
+                    "temperature": getattr(self.llm, "temperature", None),
+                    "max_tokens": getattr(self.llm, "max_tokens", None),
+                },
+            )
+            trace_logger.add_context_snapshot(analysis_node, {
+                "message_count": None,
+                "visible_tool_call_ids": [],
+                "visible_chunk_ids": list(dict.fromkeys(evidence_nodes or [])),
+                "semantics": "available_to_model_not_proven_used",
             })
-
-        trace_logger.add_temporal_next(analysis_node)
-        trace_logger.add_intermediate_claims(analysis_node, message.get("content", ""), loop_count)
-        return analysis_node
+            return analysis_node
+        except Exception:
+            return None
 
     def _trace_tool_evidence(
         self,
@@ -161,54 +144,37 @@ class BaseAgent:
         read_chunk_ids_start: set,
         loop_count: int,
         tool_call_id: str = None,
+        raw_arguments: str = None,
+        arguments_parse_error: str = None,
     ) -> List[str]:
         if trace_logger is None:
             return []
 
         query_text = self._query_from_tool_args(func_name, func_args)
-        query_node = trace_logger.add_node(
-            "plan_query",
-            content=query_text,
-            metadata={
-                "loop": loop_count,
-                "source": "tool_call_argument",
-                "implicit": True,
-                "tool_name": func_name,
-                "arguments": func_args,
-            },
-        )
-        question_node = trace_logger.latest_node_id("question")
-        trace_logger.add_edge(question_node, query_node, "decomposes_to", {
-            "loop": loop_count, "method": "implicit_from_tool_call", "timestamp": trace_logger._utc_now(),
-        })
-        trace_logger.add_edge(analysis_node, query_node, "proposes_query", {
-            "loop": loop_count, "tool_name": func_name, "tool_call_id": tool_call_id,
-            "method": "tool_call_argument", "timestamp": trace_logger._utc_now(),
-        })
-        trace_logger.add_temporal_next(query_node)
+        call_order = len([n for n in getattr(trace_logger, "nodes", []) if n["type"] == "plan_query"]) + 1
+        try:
+            query_node = trace_logger.add_plan_query(
+                analysis_node, query_text, func_name, func_args, loop_count,
+                tool_call_id=tool_call_id, call_order=call_order,
+                raw_arguments=raw_arguments, arguments_parse_error=arguments_parse_error,
+            )
+        except Exception:
+            return []
 
         tool_failed = bool(tool_log.get("error"))
         num_results = sum(len(event.get("results", [])) for event in context.search_history[search_history_start:])
-        tool_node = trace_logger.add_node(
-            "retriever_call",
-            content=f"{func_name}({query_text})",
+        operation = "read" if func_name in {"read_chunk", "read_chunks"} else "search"
+        tool_node = trace_logger.add_retriever_call(
+            query_node, func_name, query_text, func_args, loop_count,
+            tool_call_id=tool_call_id, call_order=call_order, operation=operation,
+            status="failed" if tool_failed else "success",
             metadata={
-                "loop": loop_count,
-                "tool_name": func_name,
-                "arguments": func_args,
                 "tool_log": tool_log,
                 "tool_output_preview": self._preview(tool_result, 1500),
-                "query": query_text,
                 "top_k": func_args.get("top_k") or func_args.get("k"),
                 "num_results": num_results,
             },
-            status="failed" if tool_failed else "success",
         )
-        trace_logger.add_edge(query_node, tool_node, "calls", {
-            "loop": loop_count, "call_order": len([n for n in trace_logger.nodes if n["type"] == "retriever_call"]),
-            "timestamp": trace_logger._utc_now(),
-        })
-        trace_logger.add_temporal_next(tool_node)
 
         if tool_failed:
             trace_logger.add_error(tool_node, tool_log.get("error"), "retrieval", loop_count,
@@ -228,8 +194,19 @@ class BaseAgent:
                     content = self._preview(result)
 
                 chunk_id = result.get("chunk_id")
-                evidence_node = trace_logger.add_evidence(
-                    content=content,
+                evidence_node = trace_logger.add_retrieval_result(
+                    tool_node,
+                    content,
+                    occurrence={
+                        "loop": loop_count,
+                        "tool_call_id": tool_call_id,
+                        "tool_name": event.get("tool_name"),
+                        "query": event.get("query"),
+                        "rank": rank,
+                        "raw_score": retrieval_score,
+                        "operation": "search",
+                        "result_metadata": result,
+                    },
                     metadata={
                         "loop": loop_count,
                         "source": "search_result",
@@ -243,12 +220,6 @@ class BaseAgent:
                     },
                     dedupe_key=f"chunk:{chunk_id}" if chunk_id is not None else None,
                 )
-                trace_logger.add_edge(tool_node, evidence_node, "retrieves", {
-                    "rank": rank, "score": retrieval_score, "retrieval_round": loop_count,
-                    "tool_name": event.get("tool_name"), "query": event.get("query"),
-                    "matched_sentences": matched,
-                    "timestamp": trace_logger._utc_now(),
-                })
                 evidence_nodes.append(evidence_node)
 
         requested_chunk_ids = []
@@ -266,8 +237,19 @@ class BaseAgent:
             if content is None:
                 content = self._preview(tool_result, 1500)
 
-            evidence_node = trace_logger.add_evidence(
-                content=content,
+            evidence_node = trace_logger.add_retrieval_result(
+                tool_node,
+                content,
+                occurrence={
+                    "loop": loop_count,
+                    "tool_call_id": tool_call_id,
+                    "tool_name": func_name,
+                    "query": query_text,
+                    "rank": rank,
+                    "raw_score": None,
+                    "operation": "read",
+                    "result_metadata": chunk.get("metadata", {}),
+                },
                 metadata={
                     "loop": loop_count,
                     "source": "read_chunk",
@@ -280,12 +262,8 @@ class BaseAgent:
                     **chunk.get("metadata", {}),
                 },
                 dedupe_key=f"chunk:{chunk_id}",
+                edge_type="reads",
             )
-            trace_logger.add_edge(tool_node, evidence_node, "retrieves", {
-                "rank": rank, "score": None, "retrieval_round": loop_count,
-                "tool_name": func_name, "query": query_text, "matched_sentences": [],
-                "timestamp": trace_logger._utc_now(),
-            })
             evidence_nodes.append(evidence_node)
 
         retrieval_tools = {"keyword_search", "semantic_search", "hybrid_search", "read_chunk", "read_chunks"}
@@ -348,22 +326,25 @@ class BaseAgent:
             self._trace_answer(trace_logger, analysis_node, evidence_nodes or [], final_answer,
                                loop_count, reason=reason)
         elif trace_logger:
-            llm_node = trace_logger.add_node(
-                "llm_call", f"model={getattr(self.llm, 'model', None)}; loop={loop_count}",
-                {"loop": loop_count, "model": getattr(self.llm, "model", None), "forced": True,
-                 "reason": reason, "input_tokens": 0, "output_tokens": 0, "cost": 0,
-                 "tool_calls": [], "prompt_preview": self._preview(messages), "response_preview": ""},
-                status="failed",
-            )
-            for index, evidence_node in enumerate(evidence_nodes or [], start=1):
-                trace_logger.add_edge(evidence_node, llm_node, "used_as_context", {
-                    "loop": loop_count, "context_order": index, "timestamp": trace_logger._utc_now()})
-            if not evidence_nodes and question_node:
-                trace_logger.add_edge(question_node, llm_node, "calls", {
-                    "loop": loop_count, "call_order": loop_count, "timestamp": trace_logger._utc_now()})
-            trace_logger.add_temporal_next(llm_node)
-            trace_logger.add_error(llm_node, call_error, "llm_call", loop_count, reason)
-            trace_logger.add_answer(None, "", loop_count, reason, failed=True, raw_error=str(call_error))
+            try:
+                llm_node = trace_logger.add_llm_call(
+                    model=getattr(self.llm, "model", None),
+                    loop=loop_count,
+                    message=forced_message,
+                    response={},
+                    forced=True,
+                    reason=reason,
+                    status="failed",
+                )
+                trace_logger.add_context_snapshot(llm_node, {
+                    "message_count": len(messages),
+                    "visible_chunk_ids": list(dict.fromkeys(evidence_nodes or [])),
+                    "semantics": "available_to_model_not_proven_used",
+                })
+                trace_logger.add_error(llm_node, call_error, "llm_call", loop_count, reason)
+                trace_logger.add_answer(None, "", loop_count, reason, failed=True, raw_error=str(call_error))
+            except Exception:
+                pass
 
         if self.verbose:
             print(f"Forced answer: {final_answer[:200]}...")
@@ -440,23 +421,24 @@ class BaseAgent:
             except Exception as e:
                 if self.verbose:
                     print(f"LLM error: {e}")
-                llm_node = trace_logger.add_node("llm_call",
-                    content=f"model={getattr(self.llm, 'model', None)}; loop={loop_count}",
-                    metadata={"loop": loop_count, "model": getattr(self.llm, "model", None),
-                              "temperature": getattr(self.llm, "temperature", None),
-                              "max_tokens": getattr(self.llm, "max_tokens", None), "input_tokens": 0,
-                              "output_tokens": 0, "cost": 0, "tool_calls": [],
-                              "prompt_preview": self._preview(messages), "response_preview": ""},
-                    status="failed") if trace_logger else None
                 if trace_logger:
-                    trace_logger.add_edge(question_node, llm_node, "calls", {
-                        "loop": loop_count, "call_order": loop_count, "timestamp": trace_logger._utc_now()})
-                    trace_logger.add_temporal_next(llm_node)
-                    error_node = trace_logger.add_error(llm_node, e, "llm_call", loop_count, "llm_api_error")
-                    answer_node = trace_logger.add_answer(None, "", loop_count, "llm_api_error",
-                                                          failed=True, raw_error=str(e))
-                    trace_logger.add_edge(answer_node, error_node, "failed_with", {
-                        "stage": "answer", "fatal": True, "timestamp": trace_logger._utc_now()})
+                    try:
+                        llm_node = trace_logger.add_llm_call(
+                            model=getattr(self.llm, "model", None),
+                            loop=loop_count,
+                            message={"role": "assistant", "content": "", "tool_calls": []},
+                            response={},
+                            status="failed",
+                            metadata={
+                                "temperature": getattr(self.llm, "temperature", None),
+                                "max_tokens": getattr(self.llm, "max_tokens", None),
+                            },
+                        )
+                        trace_logger.add_error(llm_node, e, "llm_call", loop_count, "llm_api_error")
+                        trace_logger.add_answer(None, "", loop_count, "llm_api_error",
+                                                failed=True, raw_error=str(e))
+                    except Exception:
+                        pass
                 return self._build_run_result(
                     "", trajectory, total_cost, loop_count, context, message_trace, messages,
                     "llm_api_error", raw_error=str(e),
@@ -513,10 +495,13 @@ class BaseAgent:
 
             for tc in tool_calls:
                 func_name = tc["function"]["name"]
+                raw_arguments = tc["function"].get("arguments", "")
+                arguments_parse_error = None
                 try:
-                    func_args = json.loads(tc["function"]["arguments"])
-                except json.JSONDecodeError:
+                    func_args = json.loads(raw_arguments)
+                except json.JSONDecodeError as exc:
                     func_args = {}
+                    arguments_parse_error = str(exc)
 
                 if self.verbose:
                     print(f"Tool: {func_name}")
@@ -543,6 +528,8 @@ class BaseAgent:
                     read_chunk_ids_start,
                     loop_count,
                     tc.get("id"),
+                    raw_arguments,
+                    arguments_parse_error,
                 )
                 evidence_nodes.extend(new_evidence_nodes)
 

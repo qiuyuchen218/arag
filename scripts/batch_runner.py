@@ -180,21 +180,14 @@ class BatchRunner:
                 "qid": qid,
                 "sample_index": sample_index,
                 "questions_file": str(self.questions_file),
-                "gold_answer": gold_answer,
-                "formal_path": "question -> plan_query -> retriever_call -> retrieved_chunk -> llm_call -> claim -> answer",
             },
         )
 
-        question_node = trace_logger.add_node(
-            "question",
-            content=question,
-            metadata={
-                "qid": qid,
-                "sample_index": sample_index,
-                "dataset": self.dataset_name,
-            },
-        )
-        trace_logger.add_temporal_next(question_node)
+        question_node = trace_logger.add_question(question, {
+            "qid": qid,
+            "sample_index": sample_index,
+            "dataset": self.dataset_name,
+        })
 
         trace_path = self.trace_dir / f"{safe_sample_id}.json"
         trace_html_path = self.trace_html_dir / f"{safe_sample_id}.html"
@@ -204,7 +197,6 @@ class BatchRunner:
             trace_logger.metadata.update({
                 "final_answer": result.get("answer", ""),
                 "pred_answer": result.get("answer", ""),
-                "gold_answer": gold_answer,
                 "termination_reason": result.get("termination_reason", ""),
                 "total_cost": result.get("total_cost", 0),
                 "loops": result.get("loops", 0),
@@ -242,7 +234,6 @@ class BatchRunner:
             trace_logger.metadata.update({
                 "final_answer": "",
                 "pred_answer": error_answer,
-                "gold_answer": gold_answer,
                 "termination_reason": "error",
                 "error": str(e),
             })
