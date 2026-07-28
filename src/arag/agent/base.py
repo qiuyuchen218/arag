@@ -121,12 +121,6 @@ class BaseAgent:
                     "max_tokens": getattr(self.llm, "max_tokens", None),
                 },
             )
-            trace_logger.add_context_snapshot(analysis_node, {
-                "message_count": None,
-                "visible_tool_call_ids": [],
-                "visible_chunk_ids": list(dict.fromkeys(evidence_nodes or [])),
-                "semantics": "available_to_model_not_proven_used",
-            })
             return analysis_node
         except Exception:
             return None
@@ -175,6 +169,29 @@ class BaseAgent:
                 "num_results": num_results,
             },
         )
+        structured_tool_result = tool_log.get("tool_result") if isinstance(tool_log, dict) else None
+        if isinstance(structured_tool_result, dict):
+            try:
+                tool_result_node = trace_logger.add_tool_result_node(tool_node, structured_tool_result)
+                for item in structured_tool_result.get("results", []) or []:
+                    if isinstance(item, dict):
+                        for span in item.get("matched_spans", []) or []:
+                            if isinstance(span, dict):
+                                trace_logger.add_evidence_span({
+                                    **span,
+                                    "source_tool_call": tool_node,
+                                    "source_branch": item.get("branch_id") or "b0",
+                                }, tool_result_node)
+                for receipt in structured_tool_result.get("results", []) or []:
+                    if isinstance(receipt, dict) and receipt.get("returned_span_ids"):
+                        # Read receipts identify delivered spans, but the receipt
+                        # text can be a whole chunk. Sentence-level EvidenceSpan
+                        # artifacts are reconstructed later from read_chunk
+                        # metadata; registering the full receipt text once per
+                        # span would duplicate evidence artifacts.
+                        continue
+            except Exception:
+                pass
 
         if tool_failed:
             trace_logger.add_error(tool_node, tool_log.get("error"), "retrieval", loop_count,
@@ -416,6 +433,29 @@ class BaseAgent:
             if self.verbose:
                 print(f"Loop {loop_count}/{self.max_loops} (Tokens: {current_tokens}/{self.max_token_budget})")
 
+            input_context_node = None
+            if trace_logger:
+                try:
+                    delivered_span_ids = []
+                    for delivery in context.context_deliveries:
+                        delivered_span_ids.extend(delivery.get("span_ids", []) or [])
+                    input_context_node = trace_logger.add_context_snapshot(None, {
+                        "snapshot_kind": "input_context",
+                        "branch_id": context.branch_id,
+                        "loop": loop_count,
+                        "message_count": len(messages),
+                        "message_indices": list(range(len(messages))),
+                        "visible_tool_call_ids": [
+                            msg.get("tool_call_id") for msg in messages if msg.get("role") == "tool"
+                        ],
+                        "visible_chunk_ids": list(dict.fromkeys(evidence_nodes or [])),
+                        "delivered_span_ids": list(dict.fromkeys(delivered_span_ids)),
+                        "semantics": "input_context_visible_to_llm_not_proven_used",
+                    })
+                    trace_logger.link_event_next(input_context_node)
+                except Exception:
+                    input_context_node = None
+
             try:
                 response = self.llm.chat(messages=messages, tools=tool_schemas)
             except Exception as e:
@@ -456,6 +496,15 @@ class BaseAgent:
                 response,
                 loop_count,
             )
+            if trace_logger and input_context_node and analysis_node:
+                try:
+                    trace_logger._node(analysis_node)["metadata"]["input_context_snapshot_id"] = input_context_node
+                    trace_logger.add_edge(input_context_node, analysis_node, "consumed_by", {
+                        "semantics": "input_context_visible_to_llm_not_proven_used",
+                        "timestamp": trace_logger.timestamp(),
+                    })
+                except Exception:
+                    pass
 
             message_trace.append({
                 "loop": loop_count,
@@ -540,6 +589,26 @@ class BaseAgent:
                         print(f"  Tokens: {tool_log['retrieved_tokens']}")
                     print()
 
+                tool_message_index = len(messages)
+                tool_result_payload = tool_log.get("tool_result") if isinstance(tool_log, dict) else None
+                delivered_span_ids = []
+                if isinstance(tool_result_payload, dict):
+                    for result_item in tool_result_payload.get("results", []) or []:
+                        if isinstance(result_item, dict):
+                            delivered_span_ids.extend(result_item.get("returned_span_ids", []) or [])
+                            delivered_span_ids.extend(
+                                span.get("span_id") for span in result_item.get("matched_spans", []) or []
+                                if isinstance(span, dict) and span.get("span_id")
+                            )
+                    delivered_span_ids.extend(tool_result_payload.get("diagnostics", {}).get("returned_span_ids", []) or [])
+                context.record_context_delivery(
+                    llm_call_id=analysis_node,
+                    tool_call_id=tc["id"],
+                    message_index=tool_message_index,
+                    span_ids=delivered_span_ids,
+                    text=tool_result,
+                    metadata={"tool_name": func_name, "tool_status": tool_log.get("status")},
+                )
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc["id"],

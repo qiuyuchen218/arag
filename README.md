@@ -200,6 +200,92 @@ A-RAG provides three retrieval tools that operate at different granularities:
 - **Strategy**: Read promising chunks identified by search, read adjacent chunks (±1) for context
 - **Context Tracker**: Prevents redundant reading of already-accessed chunks
 
+## A-RAG v2 Observability
+
+A-RAG v2 adds an optional, backward-compatible verification layer. The normal
+ReAct loop and three LLM-facing tools remain the same: `keyword_search`,
+`semantic_search`, and `read_chunk`. Each tool now preserves the old rendered
+text while also emitting a structured `ToolResult` with stable IDs, ranks,
+diagnostics, and evidence spans.
+
+Trace JSON uses schema `2.0` and keeps legacy fields. New graph nodes include
+`read_call`, `context_snapshot`, `evidence_span`, `claim`, `evidence_set`,
+`hypothesis`, `branch_fork`, and `evaluation`. The trace distinguishes
+retrieved evidence from evidence actually delivered into a tool message via
+`delivered_in_context`; this only means the model could see the text, not that
+the model used it.
+
+Verification is disabled by default:
+
+```yaml
+verification:
+  enabled: false
+  backend: "fake"  # fake | llm
+  max_evidence_set_size: 3
+  verified_threshold: 0.80
+  low_support_threshold: 0.45
+  contradiction_threshold: 0.70
+  uncertainty_threshold: 0.65
+  weights:
+    beta: 1.5
+    gamma: 1.0
+    delta: 1.0
+    rho: 0.3
+    kappa: 0.2
+    mu: 0.5
+
+repair:
+  enabled: false
+  max_branches: 2
+  max_cost: null
+```
+
+When enabled, final-answer text is split into public sentence-level claims,
+legal delivered evidence spans are scored with
+`x(c) = [E, C, P, H, R, D, U]`, and support is computed as:
+
+```text
+G_prov * E * (1-C)^beta * P^gamma * H^delta * R^rho * D^kappa * (1-U)^mu
+```
+
+`U` is verifier uncertainty, implemented as normalized entropy over
+`[p_entail, p_contradict, p_insufficient]`. Calibration is identity by default
+and marked as `calibrated=false`, so raw scores are not presented as
+probabilities.
+
+`predictions.jsonl` adds these fields without deleting old ones:
+`trace_schema_version`, `branch_id`, `claim_assessments`,
+`final_claim_support`, `root_bad_claims`, `blame_results`, `repair_history`,
+`selected_branch`, `total_repair_cost`, and `termination_reason_v2`.
+
+Offline fake-verifier run:
+
+```bash
+python scripts/batch_runner.py \
+  --config configs/example.yaml \
+  --questions data/musique/questions.json \
+  --output results/musique_v2_fake \
+  --limit 1 --workers 1 \
+  --enable-claim-verification
+```
+
+OpenAI-compatible verifier and estimated repair branch planning:
+
+```bash
+ARAG_API_KEY="$(cat api.txt)" python scripts/batch_runner.py \
+  --config configs/example.yaml \
+  --questions data/musique/questions.json \
+  --output results/musique_v2_repair \
+  --limit 1 --workers 1 \
+  --enable-claim-verification \
+  --enable-repair
+```
+
+Current repair output is `estimated` blame from graph and defect-vector rules.
+Counterfactual confirmation is represented as a pluggable interface point, but
+actual reruns of alternate branches are intentionally conservative in this
+release.
+
 ---
 
 ## 📚 Benchmarks & Datasets

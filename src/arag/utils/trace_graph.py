@@ -14,12 +14,19 @@ class TraceGraph:
     """Execution-only trace graph for one QA sample."""
 
     trace_schema_version = "2.0"
-    EVENT_TYPES = {"question", "llm_call", "plan_query", "retriever_call", "answer", "error"}
-    ARTIFACT_TYPES = {"retrieved_chunk"}
-    NODE_TYPES = EVENT_TYPES | ARTIFACT_TYPES
+    EVENT_TYPES = {"question", "llm_call", "plan_query", "retriever_call", "read_call", "context_snapshot", "branch_fork", "evaluation", "answer", "error"}
+    ARTIFACT_TYPES = {"document", "retrieved_chunk", "evidence_span", "tool_result", "answer"}
+    EPISTEMIC_TYPES = {"subgoal", "claim", "evidence_set", "hypothesis", "constraint", "query_intent", "commitment_event"}
+    NODE_TYPES = EVENT_TYPES | ARTIFACT_TYPES | EPISTEMIC_TYPES
     EDGE_TYPES = {
-        "next", "invokes", "executes", "retrieves", "reads", "generates",
-        "failed_with", "available_in_context",
+        "next", "next_in_branch", "invokes", "executes", "returns", "retrieves", "reads",
+        "contains", "consumes", "consumed_by", "generates", "delivered_in_context",
+        "delivered_into", "available_in_context",
+        "cites", "member_of", "supports", "contradicts", "jointly_supports", "depends_on",
+        "answers_subgoal", "decomposes_to", "targets_subgoal", "proposed_for",
+        "proposes", "motivates", "queries_for", "updates", "resolves_candidate_for", "influences",
+        "forked_from", "inherits", "invalidates", "rejects", "supersedes",
+        "failed_with", "evaluates",
     }
 
     def __init__(
@@ -79,7 +86,12 @@ class TraceGraph:
     def _new_id(self, node_type: str) -> str:
         prefixes = {
             "question": "q", "llm_call": "llm", "plan_query": "pq",
-            "retriever_call": "ret", "retrieved_chunk": "chunk",
+            "retriever_call": "ret", "read_call": "read", "context_snapshot": "ctx",
+            "branch_fork": "fork", "evaluation": "eval", "retrieved_chunk": "chunk",
+            "document": "doc", "evidence_span": "span", "tool_result": "toolres",
+            "subgoal": "sg", "claim": "claim", "evidence_set": "evset",
+            "hypothesis": "hyp", "constraint": "con", "query_intent": "qi",
+            "commitment_event": "commit",
             "answer": "ans", "error": "err",
         }
         self._type_counters[node_type] = self._type_counters.get(node_type, 0) + 1
@@ -106,6 +118,7 @@ class TraceGraph:
             "metadata": metadata,
             "timestamp": self.timestamp(),
             "status": status,
+            "branch_id": metadata.get("branch_id", "b0"),
         }
         if node_type in self.EVENT_TYPES:
             self._step_counter += 1
@@ -152,12 +165,15 @@ class TraceGraph:
             return
         if self._last_event_id and self._last_event_id != target:
             source_node = self._node(self._last_event_id)
-            self.add_edge(self._last_event_id, target, "next", {
+            next_metadata = {
                 "from_step": source_node["step_index"],
                 "to_step": target_node["step_index"],
                 "timestamp": target_node["timestamp"],
+                "branch_id": target_node.get("branch_id", "b0"),
                 **(metadata or {}),
-            })
+            }
+            self.add_edge(self._last_event_id, target, "next", next_metadata)
+            self.add_edge(self._last_event_id, target, "next_in_branch", next_metadata)
         self._last_event_id = target
 
     add_temporal_next = link_event_next
@@ -256,7 +272,8 @@ class TraceGraph:
             "tool_call_id": tool_call_id, "call_order": call_order, "operation": operation,
         }
         node_metadata.update(metadata or {})
-        node_id = self.add_node("retriever_call", f"{tool_name}({query})", node_metadata, status=status)
+        node_type = "read_call" if operation == "read" else "retriever_call"
+        node_id = self.add_node(node_type, f"{tool_name}({query})", node_metadata, status=status)
         self.add_edge(plan_query_id, node_id, "executes", {
             "loop": loop, "tool_call_id": tool_call_id, "tool_name": tool_name,
             "operation": operation, "timestamp": self.timestamp(),
@@ -333,7 +350,187 @@ class TraceGraph:
         return self.add_retrieval_result("", content, metadata, {}, dedupe_key)
 
     def add_context_snapshot(self, llm_id: str, context: Optional[Dict[str, Any]] = None):
-        self._node(llm_id)["metadata"]["context"] = self._clean_json(context or {})
+        context = self._clean_json(context or {})
+        node_id = self.add_node("context_snapshot", {
+            "visible_chunk_ids": context.get("visible_chunk_ids", []),
+            "delivered_span_ids": context.get("delivered_span_ids", []),
+            "message_index": context.get("message_index"),
+            "text_hash": context.get("text_hash"),
+        }, context)
+        if llm_id:
+            self._node(llm_id)["metadata"]["input_context_snapshot_id"] = node_id
+            self._node(llm_id)["metadata"]["context"] = context
+            self.add_edge(node_id, llm_id, "consumed_by", {
+                "semantics": "input_context_visible_to_llm_not_proven_used",
+                "timestamp": self.timestamp(),
+            })
+            self.link_event_next(node_id)
+        return node_id
+
+    def add_evidence_span(self, span: Dict[str, Any], source_node_id: str = None) -> str:
+        span = self._clean_json(span)
+        node_id = span.get("span_id") or self._new_id("evidence_span")
+        if any(n["id"] == node_id for n in self.nodes):
+            return node_id
+        identity = (
+            span.get("doc_id"),
+            span.get("chunk_id"),
+            span.get("sentence_id"),
+            span.get("start_offset"),
+            span.get("end_offset"),
+            span.get("content_hash") or span.get("text"),
+        )
+        if any(v is not None for v in identity):
+            for existing in self.nodes:
+                if existing.get("type") != "evidence_span":
+                    continue
+                md = existing.get("metadata", {})
+                existing_identity = (
+                    md.get("doc_id"),
+                    md.get("chunk_id"),
+                    md.get("sentence_id"),
+                    md.get("start_offset"),
+                    md.get("end_offset"),
+                    md.get("content_hash") or existing.get("content"),
+                )
+                if existing_identity == identity:
+                    if source_node_id:
+                        self.add_edge(source_node_id, existing["id"], "contains", {"timestamp": self.timestamp(), "deduped_span_id": node_id})
+                    return existing["id"]
+        added = self.add_node("evidence_span", span.get("text", ""), span, node_id=node_id)
+        if source_node_id:
+            self.add_edge(source_node_id, added, "contains", {"timestamp": self.timestamp()})
+        return added
+
+    def add_tool_result_node(self, tool_call_id: str, tool_result: Dict[str, Any]) -> str:
+        node_id = tool_result.get("call_id") or self._new_id("tool_result")
+        node_id = f"toolres_{self._safe_id_part(node_id)}"
+        if any(n["id"] == node_id for n in self.nodes):
+            return node_id
+        added = self.add_node("tool_result", tool_result.get("rendered_text", ""), tool_result, node_id=node_id)
+        self.add_edge(tool_call_id, added, "returns", {"timestamp": self.timestamp()})
+        for item in tool_result.get("results", []) or []:
+            spans = item.get("matched_spans", []) or []
+            if "returned_span_ids" in item and item.get("returned_text"):
+                # ReadReceipt spans are also stored on read chunk metadata; keep the receipt link here.
+                pass
+            for span in spans:
+                if span.get("sentence_id") is None and len(str(span.get("text", "") or "")) > 800:
+                    continue
+                sid = self.add_evidence_span(span, added)
+                self.add_edge(added, sid, "contains", {"timestamp": self.timestamp()})
+        return added
+
+    def add_claim_assessment(self, assessment: Dict[str, Any], generated_by: str = None) -> str:
+        claim = self._clean_json(assessment.get("claim", {}))
+        claim_id = claim.get("claim_id") or self._new_id("claim")
+        source = generated_by or claim.get("generated_by")
+        source_step = None
+        if source and any(n["id"] == source for n in self.nodes):
+            source_step = self._node(source).get("step_index")
+        node_id = self.add_node("claim", claim.get("content", ""), {
+            **claim,
+            "step_index": source_step,
+            "support_vector": assessment.get("support_vector"),
+            "defect_vector": assessment.get("defect_vector"),
+            "raw_score": assessment.get("raw_score"),
+            "calibrated_score": assessment.get("calibrated_score"),
+            "verifier_mode": assessment.get("verifier_mode"),
+            "authoritative": assessment.get("authoritative"),
+            "verifier_is_real": assessment.get("verifier_is_real"),
+            "verifier_decision_capable": assessment.get("verifier_decision_capable"),
+            "verifier_calibrated": assessment.get("verifier_calibrated"),
+            "verifier_authoritative_for_repair": assessment.get("verifier_authoritative_for_repair"),
+            "verifier_input_span_ids": assessment.get("verifier_input_span_ids"),
+            "verifier_input_doc_ids": assessment.get("verifier_input_doc_ids"),
+            "verifier_input_token_count": assessment.get("verifier_input_token_count"),
+            "verifier_input_hash": assessment.get("verifier_input_hash"),
+            "evidence_set_span_ids": assessment.get("evidence_set_span_ids"),
+            "evidence_isolation_valid": assessment.get("evidence_isolation_valid"),
+            "evidence_leakage_span_ids": assessment.get("evidence_leakage_span_ids"),
+        }, status=assessment.get("status", "UNCERTAIN"), node_id=claim_id)
+        if source:
+            self.add_edge(source, node_id, "generates", {"timestamp": self.timestamp()})
+        evset = assessment.get("best_evidence_set") or {}
+        evset_id = evset.get("evidence_set_id")
+        if evset_id:
+            ev_node = self.add_node("evidence_set", evset_id, evset, node_id=evset_id)
+            self.add_edge(ev_node, node_id, "jointly_supports", {
+                "status": assessment.get("status"),
+                "support_vector": assessment.get("support_vector"),
+                "timestamp": self.timestamp(),
+            })
+            for span_id in evset.get("evidence_span_ids", []) or []:
+                if any(n["id"] == span_id for n in self.nodes):
+                    self.add_edge(span_id, ev_node, "member_of", {"timestamp": self.timestamp()})
+        for dep in claim.get("dependencies", []) or []:
+            if any(n["id"] == dep for n in self.nodes):
+                self.add_edge(node_id, dep, "depends_on", {"timestamp": self.timestamp()})
+        return node_id
+
+    def add_subgoal_node(self, subgoal: Dict[str, Any], question_node_id: str = None) -> str:
+        subgoal = self._clean_json(subgoal)
+        node_id = subgoal.get("subgoal_id") or self._new_id("subgoal")
+        if any(n["id"] == node_id for n in self.nodes):
+            return node_id
+        added = self.add_node("subgoal", subgoal.get("content", ""), subgoal, status=subgoal.get("status", "open"), node_id=node_id)
+        if question_node_id:
+            self.add_edge(question_node_id, added, "decomposes_to", {"timestamp": self.timestamp()})
+        for dep in subgoal.get("dependencies", []) or []:
+            if any(n["id"] == dep for n in self.nodes):
+                self.add_edge(added, dep, "depends_on", {"timestamp": self.timestamp()})
+        return added
+
+    def add_hypothesis_node(self, hypothesis: Dict[str, Any]) -> str:
+        hypothesis = self._clean_json(hypothesis)
+        node_id = hypothesis.get("hypothesis_id") or self._new_id("hypothesis")
+        if any(n["id"] == node_id for n in self.nodes):
+            node = self._node(node_id)
+            node["metadata"].update(hypothesis)
+            node["content"] = hypothesis.get("content") or hypothesis.get("canonical_entity") or node.get("content")
+            node["status"] = hypothesis.get("status", node.get("status"))
+            return node_id
+        added = self.add_node("hypothesis", hypothesis.get("content", ""), hypothesis, status=hypothesis.get("status", "proposed"), node_id=node_id)
+        target = hypothesis.get("target_subgoal_id")
+        if target and any(n["id"] == target for n in self.nodes):
+            self.add_edge(added, target, "proposed_for", {"timestamp": self.timestamp()})
+        source = hypothesis.get("source_event_id") or hypothesis.get("generated_by")
+        if source and any(n["id"] == source for n in self.nodes):
+            self.add_edge(source, added, "proposes", {"timestamp": self.timestamp()})
+            if self._node(source)["type"] == "plan_query" and not hypothesis.get("posthoc_summary"):
+                self.add_edge(added, source, "motivates", {"timestamp": self.timestamp()})
+        return added
+
+    def add_query_intent_node(self, intent: Dict[str, Any]) -> str:
+        intent = self._clean_json(intent)
+        node_id = intent.get("query_intent_id") or self._new_id("query_intent")
+        if any(n["id"] == node_id for n in self.nodes):
+            return node_id
+        added = self.add_node("query_intent", intent.get("normalized_query") or intent.get("raw_query", ""), intent, status=intent.get("query_mode", "unknown"), node_id=node_id)
+        pq = intent.get("source_plan_query_id")
+        if pq and any(n["id"] == pq for n in self.nodes):
+            self.add_edge(pq, added, "generates", {"timestamp": self.timestamp()})
+        sg = intent.get("target_subgoal_id")
+        if sg and any(n["id"] == sg for n in self.nodes):
+            self.add_edge(added, sg, "targets_subgoal", {"timestamp": self.timestamp()})
+        return added
+
+    def add_commitment_event_node(self, event: Dict[str, Any]) -> str:
+        event = self._clean_json(event)
+        node_id = event.get("commitment_event_id") or self._new_id("commitment_event")
+        if any(n["id"] == node_id for n in self.nodes):
+            return node_id
+        added = self.add_node("commitment_event", event.get("candidate_entity", ""), event, status="premature" if event.get("is_premature") else "committed", node_id=node_id)
+        hyp = event.get("hypothesis_id")
+        if hyp and any(n["id"] == hyp for n in self.nodes):
+            self.add_edge(hyp, added, "generates", {"timestamp": self.timestamp()})
+        source = event.get("source_event_id")
+        if source and any(n["id"] == source for n in self.nodes):
+            self.add_edge(added, source, "motivates", {"timestamp": self.timestamp()})
+        target = event.get("target_subgoal_id")
+        if target and any(n["id"] == target for n in self.nodes):
+            self.add_edge(added, target, "proposed_for", {"timestamp": self.timestamp()})
+        return added
 
     def add_intermediate_claims(self, llm_id: str, message: str, loop: int) -> List[str]:
         return []
@@ -380,9 +577,15 @@ class TraceGraph:
         llm_nodes = [n for n in self.nodes if n["type"] == "llm_call"]
         errors = [n for n in self.nodes if n["type"] == "error"]
         retrieval_edges = [e for e in self.edges if e["type"] in {"retrieves", "reads"}]
+        subgoals = [n for n in self.nodes if n["type"] == "subgoal"]
+        hypotheses = [n for n in self.nodes if n["type"] == "hypothesis"]
+        query_intents = [n for n in self.nodes if n["type"] == "query_intent"]
+        claims = [n for n in self.nodes if n["type"] == "claim"]
+        required_subgoals = [n for n in subgoals if n["metadata"].get("required", True)]
+        resolved_required = [n for n in required_subgoals if n.get("status") == "resolved"]
         tool_calls_by_name: Dict[str, int] = {}
         for node in self.nodes:
-            if node["type"] == "retriever_call":
+            if node["type"] in {"retriever_call", "read_call"}:
                 name = node["metadata"].get("tool_name", "unknown")
                 tool_calls_by_name[name] = tool_calls_by_name.get(name, 0) + 1
         self.metadata.update({
@@ -415,6 +618,14 @@ class TraceGraph:
             "answer_generated": any(n["type"] == "answer" and n["status"] == "success" for n in self.nodes),
             "has_runtime_error": any(n["metadata"].get("severity") == "fatal" for n in errors),
             "runtime_error_types": sorted(set(n["metadata"].get("error_type", "unknown_error") for n in errors)),
+            "number_of_subgoals": len(subgoals),
+            "number_of_hypotheses": len(hypotheses),
+            "number_of_query_intents": len(query_intents),
+            "dependency_edge_count": sum(1 for e in self.edges if e["type"] == "depends_on"),
+            "required_subgoal_coverage": len(resolved_required) / max(len(required_subgoals), 1),
+            "authoritative_claim_count": sum(1 for n in claims if n["metadata"].get("authoritative")),
+            "unassessed_claim_count": sum(1 for n in claims if n.get("status") == "UNASSESSED"),
+            "semantic_validation_warnings": self.metadata.get("semantic_validation_warnings", []),
         })
         self.metadata.setdefault("normalized_termination_reason", "success" if not errors else "unknown_error")
         self.metadata.setdefault("debug_summary", "Execution completed successfully." if not errors else "Execution failed.")
@@ -446,12 +657,137 @@ class TraceGraph:
                 raise ValueError(f"Trace validation failed: missing edge endpoint {edge}")
             source_type = self._node(edge["source"])["type"]
             target_type = self._node(edge["target"])["type"]
-            if edge["type"] in {"retrieves", "reads"} and (source_type != "retriever_call" or target_type != "retrieved_chunk"):
-                raise ValueError("Trace validation failed: retrieves/reads must connect retriever_call to retrieved_chunk")
-            if edge["type"] == "executes" and (source_type != "plan_query" or target_type != "retriever_call"):
-                raise ValueError("Trace validation failed: executes must connect plan_query to retriever_call")
-            if edge["type"] == "generates" and (source_type != "llm_call" or target_type != "answer"):
-                raise ValueError("Trace validation failed: generates must connect llm_call to answer")
+            if edge["type"] in {"retrieves", "reads"} and (source_type not in {"retriever_call", "read_call"} or target_type != "retrieved_chunk"):
+                raise ValueError("Trace validation failed: retrieves/reads must connect tool call to retrieved_chunk")
+            if edge["type"] == "executes" and (source_type != "plan_query" or target_type not in {"retriever_call", "read_call"}):
+                raise ValueError("Trace validation failed: executes must connect plan_query to tool call")
+            if edge["type"] == "generates" and source_type not in {"llm_call", "answer", "plan_query", "hypothesis"}:
+                raise ValueError("Trace validation failed: generates source must be llm_call, answer, plan_query, or hypothesis")
+        self.validate_v2()
+
+    def validate_v2(self):
+        errors = []
+        id_set = {node["id"] for node in self.nodes}
+        by_id = {node["id"]: node for node in self.nodes}
+        event_types = self.EVENT_TYPES
+        for node in self.nodes:
+            if node["type"] not in event_types and node.get("step_index") is not None:
+                errors.append(f"artifact_or_epistemic_step_index:{node['id']}")
+            if node["type"] == "context_snapshot":
+                delivered = node.get("metadata", {}).get("delivered_span_ids", []) or []
+                if len(delivered) != len(set(delivered)):
+                    errors.append(f"duplicate_delivered_span_ids:{node['id']}")
+                missing = [sid for sid in delivered if sid not in id_set]
+                if missing:
+                    errors.append(f"missing_delivered_span:{node['id']}:{missing[:3]}")
+            if node["type"] == "evidence_span":
+                md = node.get("metadata", {})
+                text = str(node.get("content", "") or "")
+                start = md.get("start_offset", 0) or 0
+                end = md.get("end_offset", 0) or 0
+                if end and start and int(end) < int(start):
+                    errors.append(f"invalid_span_offsets:{node['id']}")
+                if md.get("sentence_id") is None and len(text) > 800:
+                    errors.append(f"duplicate_full_chunk_span:{node['id']}")
+        identities = {}
+        for node in self.nodes:
+            if node["type"] != "evidence_span":
+                continue
+            md = node.get("metadata", {})
+            identity = (
+                md.get("doc_id"),
+                md.get("chunk_id"),
+                md.get("sentence_id"),
+                md.get("start_offset"),
+                md.get("end_offset"),
+                md.get("content_hash") or node.get("content"),
+            )
+            if identity in identities:
+                errors.append(f"duplicate_artifact_identity:{identities[identity]}:{node['id']}")
+            identities[identity] = node["id"]
+        for node in self.nodes:
+            if node["type"] != "claim":
+                continue
+            md = node.get("metadata", {})
+            evset = None
+            for edge in self.edges:
+                if edge["type"] == "jointly_supports" and edge["target"] == node["id"]:
+                    evset = by_id.get(edge["source"])
+                    break
+            if evset:
+                ev_ids = set(evset.get("metadata", {}).get("evidence_span_ids", []) or [])
+                in_ids = set(md.get("verifier_input_span_ids", []) or [])
+                if ev_ids != in_ids:
+                    errors.append(f"evidence_set_verifier_leak:{node['id']}")
+            if md.get("evidence_isolation_valid") is False:
+                errors.append(f"evidence_isolation_invalid:{node['id']}")
+            claim = md
+            if claim.get("claim_type") in {"answer_claim", "factual_claim"} and not claim.get("dependencies"):
+                errors.append(f"missing_expected_dependency:{node['id']}")
+        for edge in self.edges:
+            if edge["type"] == "next_in_branch":
+                s, t = by_id[edge["source"]], by_id[edge["target"]]
+                if s.get("branch_id", "b0") != t.get("branch_id", "b0"):
+                    errors.append(f"next_in_branch_cross_branch:{edge['source']}->{edge['target']}")
+            if edge["type"] == "consumed_by":
+                s, t = by_id[edge["source"]], by_id[edge["target"]]
+                if s["type"] != "context_snapshot" or t["type"] != "llm_call":
+                    errors.append(f"bad_consumed_by:{edge['source']}->{edge['target']}")
+                if (s.get("step_index") or 0) >= (t.get("step_index") or 0):
+                    errors.append(f"context_not_before_llm:{edge['source']}->{edge['target']}")
+            if edge["type"] in {"proposes", "motivates", "generates", "updates", "executes", "returns", "targets_subgoal"}:
+                s, t = by_id[edge["source"]], by_id[edge["target"]]
+                s_step = s.get("step_index") or s.get("metadata", {}).get("step_index") or s.get("metadata", {}).get("first_proposed_at")
+                t_step = t.get("step_index") or t.get("metadata", {}).get("step_index") or t.get("metadata", {}).get("first_proposed_at")
+                if s_step is not None and t_step is not None and int(s_step) > int(t_step):
+                    errors.append(f"causal_edge_temporal_invalid:{edge['source']}->{edge['target']}")
+                if s.get("branch_id", "b0") != t.get("branch_id", "b0"):
+                    errors.append(f"causal_edge_cross_branch:{edge['source']}->{edge['target']}")
+        incoming_next = {}
+        outgoing_next = {}
+        for edge in self.edges:
+            if edge["type"] == "next_in_branch":
+                incoming_next[edge["target"]] = incoming_next.get(edge["target"], 0) + 1
+                outgoing_next[edge["source"]] = outgoing_next.get(edge["source"], 0) + 1
+        for node_id, count in incoming_next.items():
+            if count > 1:
+                errors.append(f"multiple_next_predecessors:{node_id}")
+        for node_id, count in outgoing_next.items():
+            if count > 1:
+                errors.append(f"multiple_next_successors:{node_id}")
+        for node in self.nodes:
+            if node["type"] == "evidence_set":
+                span_ids = node.get("metadata", {}).get("evidence_span_ids", []) or []
+                missing = [sid for sid in span_ids if sid not in id_set]
+                if missing:
+                    errors.append(f"evidence_set_missing_span:{node['id']}:{missing[:3]}")
+                docs = sorted({by_id[sid].get("metadata", {}).get("doc_id") for sid in span_ids if sid in by_id})
+                docs = [str(d) for d in docs if d is not None]
+                expected = sorted(str(d) for d in (node.get("metadata", {}).get("unique_doc_ids", []) or []))
+                if docs != expected:
+                    errors.append(f"evidence_set_doc_mismatch:{node['id']}")
+        repair_plan = self.metadata.get("repair_plan") or {}
+        root = repair_plan.get("root_cause_node")
+        rollback = repair_plan.get("rollback_checkpoint")
+        if root and root in by_id:
+            if by_id[root].get("metadata", {}).get("posthoc_summary"):
+                errors.append(f"root_is_posthoc_summary:{root}")
+            if rollback and rollback in by_id:
+                r_step = by_id[root].get("step_index") or by_id[root].get("metadata", {}).get("step_index") or by_id[root].get("metadata", {}).get("first_proposed_at")
+                rb_step = by_id[rollback].get("step_index") or by_id[rollback].get("metadata", {}).get("step_index")
+                if r_step is not None and rb_step is not None and int(rb_step) >= int(r_step):
+                    errors.append(f"rollback_not_before_root:{rollback}:{root}")
+                root_llm = repair_plan.get("root_generator_llm")
+                if root_llm:
+                    consumed = any(e["type"] == "consumed_by" and e["source"] == rollback and e["target"] == root_llm for e in self.edges)
+                    if not consumed:
+                        errors.append(f"rollback_not_consumed_by_root_generator:{rollback}:{root_llm}")
+        if errors:
+            self.metadata["trace_valid"] = False
+            self.metadata["validation_errors"] = errors
+            raise ValueError("Trace v2 validation failed: " + "; ".join(errors[:5]))
+        self.metadata["trace_valid"] = True
+        self.metadata["validation_errors"] = []
 
     def to_dict(self) -> Dict[str, Any]:
         self.finalize_metadata()
@@ -470,7 +806,14 @@ class TraceGraph:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         graph = self.to_dict()
-        self.validate()
+        try:
+            self.validate()
+            graph = self.to_dict()
+        except ValueError as exc:
+            self.metadata["trace_valid"] = False
+            self.metadata.setdefault("validation_errors", [str(exc)])
+            self.metadata["trace_validation_error"] = str(exc)
+            graph = self.to_dict()
         with open(path, "w", encoding="utf-8") as f:
             json.dump(graph, f, ensure_ascii=False, indent=2, allow_nan=False)
 
@@ -494,6 +837,7 @@ class TraceGraph:
             key=lambda n: n.get("step_index") or 0,
         )
         artifact_nodes = [n for n in nodes if n["type"] in self.ARTIFACT_TYPES]
+        epistemic_nodes = [n for n in nodes if n["type"] in self.EPISTEMIC_TYPES]
         positions: Dict[str, Dict[str, int]] = {}
         x_gap, y_gap = 210, 115
         for idx, node in enumerate(event_nodes):
@@ -503,11 +847,20 @@ class TraceGraph:
             source = source_edges[0]["source"] if source_edges else None
             base_x = positions.get(source, {"x": 90 + (idx % 6) * x_gap})["x"]
             positions[node["id"]] = {"x": base_x, "y": 330 + (idx % 5) * y_gap}
+        for idx, node in enumerate(epistemic_nodes):
+            source_edges = [e for e in edges if e["target"] == node["id"] or e["source"] == node["id"]]
+            anchor = None
+            if source_edges:
+                edge = source_edges[0]
+                anchor = edge["source"] if edge["source"] != node["id"] else edge["target"]
+            base_x = positions.get(anchor, {"x": 120 + (idx % 8) * x_gap})["x"]
+            positions[node["id"]] = {"x": base_x, "y": 650 + (idx % 6) * y_gap}
         width = max([p["x"] for p in positions.values()] or [900]) + 220
         height = max([p["y"] for p in positions.values()] or [600]) + 180
         colors = {
             "question": "#2563eb", "llm_call": "#7c3aed", "plan_query": "#0891b2",
-            "retriever_call": "#ea580c", "retrieved_chunk": "#16a34a",
+            "retriever_call": "#ea580c", "read_call": "#f59e0b", "context_snapshot": "#0d9488",
+            "retrieved_chunk": "#16a34a", "evidence_span": "#15803d", "claim": "#be123c",
             "answer": "#dc2626", "error": "#991b1b",
         }
         edge_lines = []

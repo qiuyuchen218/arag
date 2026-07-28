@@ -3,6 +3,8 @@
 from typing import Any, Dict, List, Set
 from dataclasses import dataclass, field
 
+from arag.core.schemas import clean_json, content_hash, stable_hash, utc_now
+
 
 @dataclass
 class RetrievalLog:
@@ -16,6 +18,7 @@ class AgentContext:
     """Context manager for agent execution state."""
 
     def __init__(self):
+        self.branch_id: str = "b0"
         # Token statistics
         self.total_retrieved_tokens: int = 0
         self.retrieval_logs: List[RetrievalLog] = []
@@ -26,6 +29,9 @@ class AgentContext:
 
         # Observability state exported with each prediction for debugging.
         self.read_chunks: Dict[str, Dict[str, Any]] = {}
+        self.corpus_cache_read_ids: Set[str] = set()
+        self.branch_read_chunk_ids: Dict[str, Set[str]] = {self.branch_id: set()}
+        self.context_deliveries: List[Dict[str, Any]] = []
 
     def add_retrieval_log(
         self,
@@ -53,7 +59,7 @@ class AgentContext:
         self.search_history.append({
             "tool_name": tool_name,
             "query": query,
-            "results": results,
+            "results": clean_json(results),
             "metadata": metadata or {},
         })
 
@@ -67,6 +73,8 @@ class AgentContext:
         """Mark chunk as read and optionally store its full content."""
         chunk_id = str(chunk_id)
         self.read_chunk_ids.add(chunk_id)
+        self.corpus_cache_read_ids.add(chunk_id)
+        self.branch_read_chunk_ids.setdefault(self.branch_id, set()).add(chunk_id)
         if content is not None:
             self.read_chunks[chunk_id] = {
                 "chunk_id": chunk_id,
@@ -74,6 +82,35 @@ class AgentContext:
                 "tokens": tokens,
                 "metadata": metadata or {},
             }
+
+    def has_branch_read_chunk(self, chunk_id: str, branch_id: str = None) -> bool:
+        branch_id = branch_id or self.branch_id
+        return str(chunk_id) in self.branch_read_chunk_ids.get(branch_id, set())
+
+    def record_context_delivery(
+        self,
+        llm_call_id: str,
+        tool_call_id: str,
+        message_index: int,
+        span_ids: List[str],
+        text: str,
+        branch_id: str = None,
+        metadata: Dict[str, Any] = None,
+    ) -> Dict[str, Any]:
+        delivery = {
+            "delivery_id": f"ctxdel_{stable_hash(branch_id or self.branch_id, llm_call_id, tool_call_id, message_index, span_ids, text)}",
+            "branch_id": branch_id or self.branch_id,
+            "llm_call_id": llm_call_id,
+            "tool_call_id": tool_call_id,
+            "message_index": message_index,
+            "span_ids": list(dict.fromkeys(str(s) for s in span_ids or [])),
+            "text_hash": content_hash(text or ""),
+            "timestamp": utc_now(),
+            "semantics": "delivered_to_context_not_proven_used",
+            "metadata": metadata or {},
+        }
+        self.context_deliveries.append(delivery)
+        return delivery
 
     def is_chunk_read(self, chunk_id: str) -> bool:
         """Check if chunk has been read."""
@@ -100,6 +137,9 @@ class AgentContext:
         self.read_chunk_ids = set()
         self.search_history = []
         self.read_chunks = {}
+        self.corpus_cache_read_ids = set()
+        self.branch_read_chunk_ids = {self.branch_id: set()}
+        self.context_deliveries = []
         self.total_retrieved_tokens = 0
 
     def get_summary(self) -> Dict[str, Any]:
@@ -118,6 +158,12 @@ class AgentContext:
             "chunks_read_ids": list(self.read_chunk_ids),
             "read_chunks": self.read_chunks,
             "search_history": self.search_history,
+            "branch_id": self.branch_id,
+            "corpus_cache_read_ids": list(self.corpus_cache_read_ids),
+            "branch_read_chunk_ids": {
+                branch: sorted(ids) for branch, ids in self.branch_read_chunk_ids.items()
+            },
+            "context_deliveries": self.context_deliveries,
         }
 
     def to_dict(self) -> Dict[str, Any]:

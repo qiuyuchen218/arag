@@ -3,6 +3,7 @@
 from typing import Any, Dict, List, Tuple, TYPE_CHECKING
 
 from arag.tools.base import BaseTool
+from arag.core.schemas import ToolResult, stable_hash, utc_now
 
 if TYPE_CHECKING:
     from arag.core.context import AgentContext
@@ -33,7 +34,23 @@ class ToolRegistry:
             return f"Error: Tool '{name}' not found", {"error": "tool_not_found"}
         
         try:
-            return tool.execute(context, **kwargs)
+            result = tool.execute(context, **kwargs)
+            if isinstance(result, ToolResult):
+                return result.to_legacy_tuple()
+            if isinstance(result, tuple) and len(result) == 2:
+                rendered, log = result
+                log = dict(log or {})
+                log.setdefault("tool_result", ToolResult(
+                    call_id=f"call_{stable_hash(name, kwargs, utc_now())}",
+                    tool_name=name,
+                    status="failed" if log.get("error") else "success",
+                    rendered_text=str(rendered),
+                    diagnostics={k: v for k, v in log.items() if k not in {"error", "retrieved_tokens"}},
+                    retrieved_tokens=int(log.get("retrieved_tokens", 0) or 0),
+                    error=log.get("error"),
+                ).to_dict())
+                return rendered, log
+            return str(result), {"tool_result": result}
         except Exception as e:
             return f"Error executing tool: {str(e)}", {"error": str(e)}
     

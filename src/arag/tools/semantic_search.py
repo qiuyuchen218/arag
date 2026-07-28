@@ -6,6 +6,7 @@ import threading
 import numpy as np
 from typing import Dict, List, Any, Tuple, TYPE_CHECKING
 
+from arag.core.schemas import EvidenceSpan, SearchHit, ToolResult, artifact_id, result_dict, stable_hash
 from arag.tools.base import BaseTool
 
 if TYPE_CHECKING:
@@ -45,15 +46,30 @@ class SemanticSearchTool(BaseTool):
         self.chunks_file = chunks_file
         self.index_dir = index_dir
         self.model_name = model_name
-        self.device = device
+        self.device = self._resolve_device(device)
 
-        self.embedding_model = SentenceTransformer(model_name, device=device)
+        self.embedding_model = SentenceTransformer(model_name, device=self.device)
         self._load_index()
+        self.corpus_version = stable_hash(chunks_file, len(self.chunks))
+        self.index_version = stable_hash(index_dir, len(self.sentences), getattr(self.embeddings, "shape", None))
         self.tokenizer = tiktoken.encoding_for_model("gpt-4o")
 
     @property
     def name(self) -> str:
         return "semantic_search"
+
+    @staticmethod
+    def _resolve_device(device: str = None) -> str:
+        if device and str(device).startswith("cuda"):
+            try:
+                import torch
+                if not torch.cuda.is_available():
+                    print(f"Warning: requested device {device} but CUDA is unavailable; falling back to cpu")
+                    return "cpu"
+            except Exception:
+                print(f"Warning: requested device {device} but CUDA availability could not be checked; falling back to cpu")
+                return "cpu"
+        return device
 
     def _load_index(self):
         index_file = os.path.join(self.index_dir, "sentence_index.pkl")
@@ -100,14 +116,16 @@ RETURNS: Abbreviated snippets with matched sentences. Use read_chunk to get full
             }
         }
 
-    def execute(self, context: 'AgentContext', query: str, top_k: int = 5) -> Tuple[str, Dict[str, Any]]:
+    def execute(self, context: 'AgentContext', query: str, top_k: int = 5, candidate_pool: int = None) -> Tuple[str, Dict[str, Any]]:
         top_k = min(top_k, 20)
+        candidate_pool = max(candidate_pool or top_k * 5, top_k)
+        call_id = f"sem_{stable_hash(getattr(context, 'branch_id', 'b0'), query, top_k, len(context.search_history))}"
 
         with self._embedding_lock:
             query_embedding = self.embedding_model.encode([query], normalize_embeddings=True)[0]
 
         similarities = np.dot(self.embeddings, query_embedding)
-        top_indices = np.argsort(similarities)[::-1][:top_k * 3]
+        top_indices = np.argsort(similarities)[::-1][:candidate_pool]
 
         chunk_sentences = {}
         for idx in top_indices:
@@ -129,7 +147,18 @@ RETURNS: Abbreviated snippets with matched sentences. Use read_chunk to get full
             chunk_scores.append((chunk_id, max_similarity, sents))
 
         chunk_scores.sort(key=lambda x: x[1], reverse=True)
-        top_chunks = chunk_scores[:top_k]
+        diverse = []
+        seen_docs = set()
+        for candidate_rank, item in enumerate(chunk_scores, start=1):
+            chunk_id = item[0]
+            doc_id = str(self.chunks[chunk_id].get("doc_id", chunk_id)) if isinstance(self.chunks, dict) else str(chunk_id)
+            if doc_id in seen_docs and len(diverse) >= max(1, top_k // 2):
+                continue
+            seen_docs.add(doc_id)
+            diverse.append((candidate_rank, *item))
+            if len(diverse) >= top_k:
+                break
+        top_chunks = diverse
 
         if not top_chunks:
             context.add_search_event(
@@ -138,26 +167,50 @@ RETURNS: Abbreviated snippets with matched sentences. Use read_chunk to get full
                 results=[],
                 metadata={"chunks_found": 0}
             )
-            return f"No results for: {query}", {"retrieved_tokens": 0, "chunks_found": 0}
+            result = ToolResult(call_id, self.name, "empty", f"No results for: {query}", [], {"chunks_found": 0, "candidate_pool": candidate_pool}, 0, 0)
+            return result.to_legacy_tuple()
 
         result_parts = []
         search_results = []
 
-        for chunk_id, max_sim, sents in top_chunks:
+        for final_rank, (candidate_rank, chunk_id, max_sim, sents) in enumerate(top_chunks, start=1):
             chunk_text = self.chunks[chunk_id]['text']
             sents_sorted = sorted(sents, key=lambda x: chunk_text.find(x['sentence']))
             matched_text = "... " + " ... ".join([s['sentence'] for s in sents_sorted]) + " ..."
-            search_results.append({
-                "chunk_id": chunk_id,
-                "score": max_sim,
-                "matched_sentences": sents_sorted,
-            })
+            spans = [
+                EvidenceSpan.from_text(
+                    s["sentence"],
+                    self.corpus_version,
+                    self.chunks[chunk_id].get("doc_id", chunk_id),
+                    chunk_id,
+                    int(s.get("position", 0)),
+                    max(chunk_text.find(s["sentence"]), 0),
+                    max(chunk_text.find(s["sentence"]), 0) + len(s["sentence"]),
+                )
+                for s in sents_sorted[:5]
+            ]
+            hit = SearchHit(
+                artifact_id=artifact_id(self.corpus_version, self.chunks[chunk_id].get("doc_id", chunk_id), chunk_id),
+                doc_id=str(self.chunks[chunk_id].get("doc_id", chunk_id)),
+                chunk_id=str(chunk_id),
+                sentence_ids=[int(s.get("position", 0)) for s in sents_sorted],
+                matched_spans=spans,
+                retrieval_channel="dense",
+                raw_score=float(max_sim),
+                candidate_rank=candidate_rank,
+                final_rank=final_rank,
+                metadata={"score_semantics": "raw_cosine_similarity_not_probability"},
+            )
+            item_dict = result_dict(hit)
+            item_dict["score"] = max_sim
+            item_dict["matched_sentences"] = sents_sorted
+            search_results.append(item_dict)
             result_parts.append(f"Chunk ID: {chunk_id} (Similarity: {max_sim:.3f})\nMatched: {matched_text}")
 
         tool_result = "\n\n".join(result_parts)
 
         all_matched = []
-        for _, _, sents in top_chunks:
+        for _, _, _, sents in top_chunks:
             all_matched.extend([s['sentence'] for s in sents])
 
         retrieved_tokens = len(self.tokenizer.encode("\n".join(all_matched))) if all_matched else 0
@@ -168,7 +221,7 @@ RETURNS: Abbreviated snippets with matched sentences. Use read_chunk to get full
             metadata={
                 "query": query,
                 "chunks_found": len(top_chunks),
-                "chunk_ids": [chunk_id for chunk_id, _, _ in top_chunks],
+                "chunk_ids": [chunk_id for _, chunk_id, _, _ in top_chunks],
             }
         )
         context.add_search_event(
@@ -178,11 +231,29 @@ RETURNS: Abbreviated snippets with matched sentences. Use read_chunk to get full
             metadata={
                 "chunks_found": len(top_chunks),
                 "retrieved_tokens": retrieved_tokens,
+                "candidate_pool": candidate_pool,
+                "embedding_model": self.model_name,
+                "index_version": self.index_version,
+                "score_semantics": "raw_cosine_similarity_not_probability",
             }
         )
 
-        return tool_result, {
-            "retrieved_tokens": retrieved_tokens,
-            "chunks_found": len(top_chunks),
-            "chunk_ids": [chunk_id for chunk_id, _, _ in top_chunks],
-        }
+        return ToolResult(
+            call_id=call_id,
+            tool_name=self.name,
+            status="success",
+            rendered_text=tool_result,
+            results=search_results,
+            diagnostics={
+                "retrieved_tokens": retrieved_tokens,
+                "chunks_found": len(top_chunks),
+                "candidate_pool": candidate_pool,
+                "embedding_model": self.model_name,
+                "index_version": self.index_version,
+                "corpus_version": self.corpus_version,
+                "score_semantics": "raw_cosine_similarity_not_probability",
+                "fusion": "dense_only",
+                "reranker": None,
+            },
+            retrieved_tokens=retrieved_tokens,
+        ).to_legacy_tuple()

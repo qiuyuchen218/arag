@@ -39,3 +39,38 @@ data:
   
 output:
   results_dir: "results/"
+
+trace:
+  schema_version: "2.0"
+  save_html: true
+  record_context_text: true
+
+verification:
+  enabled: false
+  mode: "fake_test"  # fake_test | real_uncalibrated | real_calibrated
+  backend: "fake"  # backward-compatible alias: fake | llm
+  model: null
+  timeout: 60
+  max_retries: 2
+  max_evidence_set_size: 3
+  verified_threshold: 0.80
+  low_support_threshold: 0.45
+  contradiction_threshold: 0.70
+  uncertainty_threshold: 0.65
+  relevance_threshold: 0.50
+  prompt_token_budget: 4096
+  weights:
+    beta: 1.5
+    gamma: 1.0
+    delta: 1.0
+    rho: 0.3
+    kappa: 0.2
+    mu: 0.5
+
+repair:
+  enabled: false
+  dry_run: true
+  max_branches: 2
+  max_cost: null
+  min_blame: 0.20
+  min_expected_gain: 0.10
