@@ -31,8 +31,15 @@ def _load_trace(row: Dict[str, Any]) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _rate(values: List[bool]) -> float:
-    return sum(1 for v in values if v) / max(len(values), 1)
+def _rate(values: List[bool]) -> Dict[str, Any]:
+    numerator = sum(1 for v in values if v)
+    denominator = len(values)
+    return {
+        "value": (numerator / denominator) if denominator else None,
+        "numerator": numerator,
+        "denominator": denominator,
+        "reason_if_undefined": None if denominator else "empty_denominator",
+    }
 
 
 def _metric_for_row(row: Dict[str, Any], with_gold_eval: bool) -> Dict[str, Any]:
@@ -81,7 +88,10 @@ def _metric_for_row(row: Dict[str, Any], with_gold_eval: bool) -> Dict[str, Any]
         "repair_trigger": repair_trigger,
         "abstention": str((row.get("answer_assessment") or {}).get("completeness_status", "")).upper() in {"INCOMPLETE", "MISSING", "TARGET_UNRESOLVED"},
         "verifier_uncertain": any(c.get("status") == "VERIFIER_UNCERTAIN" for c in claims),
-        "plan_uncertain": "PLAN_UNCERTAIN" in row.get("failure_types", []),
+        "plan_uncertain": (
+            "PLAN_UNCERTAIN" in row.get("failure_types", [])
+            or str((row.get("answer_assessment") or {}).get("completeness_status", "")).upper() == "PLAN_UNCERTAIN"
+        ),
         "average_root_candidates": len(blame),
         "blame_score_variance": variance(scores) if len(scores) > 1 else 0.0,
         "root_margin_top1_top2": (top_scores[0] - top_scores[1]) if len(top_scores) > 1 else (top_scores[0] if top_scores else 0.0),

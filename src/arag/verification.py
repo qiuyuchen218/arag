@@ -26,6 +26,8 @@ class Claim:
     criticality: float = 1.0
     status: str = "UNCERTAIN"
     claim_type: str = "answer_claim"
+    aligned_relation_ids: List[str] = field(default_factory=list)
+    resolves_subgoal_ids: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -257,7 +259,16 @@ class ClaimSupportScorer:
         self.backend = backend
         self.config = config or SupportConfig()
 
-    def score(self, claim: Claim, spans: List[EvidenceSpan], delivered_span_ids: List[str], parent_supports: List[float] = None) -> Dict[str, Any]:
+    def score(
+        self,
+        claim: Claim,
+        spans: List[EvidenceSpan],
+        delivered_span_ids: List[str],
+        parent_supports: List[float] = None,
+        dependency_ids: List[str] = None,
+        blocked_dependency_ids: List[str] = None,
+        plan_semantic_valid: bool = True,
+    ) -> Dict[str, Any]:
         legal = [s for s in spans if s.span_id in set(delivered_span_ids or [])]
         selected_spans = _select_evidence_set(claim, legal, max_spans=3)
         g_prov = 1.0 if selected_spans else 0.0
@@ -265,8 +276,10 @@ class ClaimSupportScorer:
         e = max(0.0, min(1.0, verification.evidence_entailment if verification.evidence_entailment is not None else verification.p_entail))
         c = max(0.0, min(1.0, verification.evidence_contradiction if verification.evidence_contradiction is not None else verification.p_contradict))
         p = g_prov
-        h_available = parent_supports is not None
-        h = min(parent_supports) if parent_supports else 1.0
+        dependency_ids = list(dependency_ids if dependency_ids is not None else (claim.dependencies or []))
+        blocked_dependency_ids = list(blocked_dependency_ids or [])
+        h_available = bool(plan_semantic_valid)
+        h = 0.0 if not plan_semantic_valid else (min(parent_supports) if parent_supports else 1.0)
         r = max((verification.evidence_relevance if verification.evidence_relevance is not None else verification.relevance) if selected_spans else 0.0, 0.0)
         unique_docs = {s.doc_id for s in selected_spans}
         d = min(1.0, len(unique_docs) / 1.0) if selected_spans else 0.0
@@ -291,39 +304,53 @@ class ClaimSupportScorer:
         if not verification.authoritative:
             status = "UNASSESSED"
             diagnostic_status = "FAKE_SUPPORTED" if verification.verifier_mode in {"fake_test", "heuristic_diagnostic"} and e >= cfg.entailment_threshold else "UNASSESSED"
+            evidence_status = "UNASSESSED"
+            reasoning_status = "UNASSESSED"
         elif not g_prov:
-            status = "INVALID_PROVENANCE"
+            evidence_status = "INVALID_PROVENANCE"
+            reasoning_status = _reasoning_status(plan_semantic_valid, h, blocked_dependency_ids, claim.aligned_relation_ids, cfg)
+            status = _overall_status(evidence_status, reasoning_status)
             diagnostic_status = status
         elif c >= cfg.contradiction_threshold:
-            status = "CONTRADICTED"
+            evidence_status = "CONTRADICTED"
+            reasoning_status = _reasoning_status(plan_semantic_valid, h, blocked_dependency_ids, claim.aligned_relation_ids, cfg)
+            status = _overall_status(evidence_status, reasoning_status)
             diagnostic_status = status
         elif not evidence_isolation_valid:
-            status = "INVALID_PROVENANCE"
+            evidence_status = "INVALID_PROVENANCE"
+            reasoning_status = _reasoning_status(plan_semantic_valid, h, blocked_dependency_ids, claim.aligned_relation_ids, cfg)
+            status = _overall_status(evidence_status, reasoning_status)
             diagnostic_status = status
-        elif h < cfg.low_support_threshold:
-            status = "DEPENDENCY_BROKEN"
-            diagnostic_status = status
-        elif verification.calibrated and raw >= cfg.verified_threshold:
-            status = "VERIFIED"
+        elif verification.calibrated and raw >= cfg.verified_threshold and h >= cfg.dependency_threshold:
+            evidence_status = "VERIFIED"
+            reasoning_status = _reasoning_status(plan_semantic_valid, h, blocked_dependency_ids, claim.aligned_relation_ids, cfg)
+            status = _overall_status(evidence_status, reasoning_status)
             diagnostic_status = status
         elif (
             e >= cfg.entailment_threshold
             and c <= cfg.contradiction_threshold
             and p >= cfg.provenance_threshold
-            and h >= cfg.dependency_threshold
             and r >= cfg.relevance_threshold
             and u <= cfg.uncertainty_threshold
         ):
-            status = "VERIFIED"
+            evidence_status = "VERIFIED"
+            reasoning_status = _reasoning_status(plan_semantic_valid, h, blocked_dependency_ids, claim.aligned_relation_ids, cfg)
+            status = _overall_status(evidence_status, reasoning_status)
             diagnostic_status = status
         elif e < cfg.entailment_threshold and c < cfg.contradiction_threshold:
-            status = "UNSUPPORTED"
+            evidence_status = "UNSUPPORTED"
+            reasoning_status = _reasoning_status(plan_semantic_valid, h, blocked_dependency_ids, claim.aligned_relation_ids, cfg)
+            status = _overall_status(evidence_status, reasoning_status)
             diagnostic_status = status
         elif u >= cfg.uncertainty_threshold:
-            status = "UNCERTAIN"
+            evidence_status = "VERIFIER_UNCERTAIN"
+            reasoning_status = _reasoning_status(plan_semantic_valid, h, blocked_dependency_ids, claim.aligned_relation_ids, cfg)
+            status = _overall_status(evidence_status, reasoning_status)
             diagnostic_status = status
         else:
-            status = "UNCERTAIN"
+            evidence_status = "VERIFIER_UNCERTAIN"
+            reasoning_status = _reasoning_status(plan_semantic_valid, h, blocked_dependency_ids, claim.aligned_relation_ids, cfg)
+            status = _overall_status(evidence_status, reasoning_status)
             diagnostic_status = status
         claim.status = status
         selected_docs = sorted({s.doc_id for s in selected_spans})
@@ -340,7 +367,12 @@ class ClaimSupportScorer:
             "support_vector": {
                 "E": e, "C": c, "P": p, "H": h, "R": r, "D": d, "U": u,
                 "details": {
-                    "H": {"available": h_available, "reason": "no dependencies" if not h_available else "parent supports"},
+                    "H": {
+                        "available": h_available,
+                        "reason": "plan uncertain" if not plan_semantic_valid else ("no dependencies" if not dependency_ids else "actual dependency supports"),
+                        "dependency_ids": dependency_ids,
+                        "blocked_dependency_ids": blocked_dependency_ids,
+                    },
                     "R": {"available": bool(selected_spans), "reason": "verifier relevance over selected EvidenceSet" if selected_spans else "no legal evidence"},
                     "D": {"available": bool(selected_spans), "reason": "unique docs from selected EvidenceSet" if selected_spans else "no legal evidence"},
                     "evidence_isolation_valid": evidence_isolation_valid,
@@ -360,6 +392,9 @@ class ClaimSupportScorer:
             "verifier_authoritative_for_repair": verification.authoritative and not verification.calibrated,
             "repair_eligible": verification.authoritative and status in {"UNSUPPORTED", "CONTRADICTED", "INVALID_PROVENANCE", "DEPENDENCY_BROKEN", "UNCERTAIN"},
             "diagnostic_status": diagnostic_status,
+            "evidence_status": evidence_status,
+            "reasoning_status": reasoning_status,
+            "overall_status": status,
             "verifier_model": verification.verifier_model,
             "prompt_hash": verification.prompt_hash,
             "verifier_input_span_ids": verifier_input_span_ids,
@@ -406,6 +441,24 @@ DATE_LIKE_RE = re.compile(r"\b\d{3,4}\b")
 
 def _extract_span_refs(text: str) -> List[str]:
     return re.findall(r"\bspan_[0-9a-fA-F]+\b", text or "")
+
+
+def _reasoning_status(plan_semantic_valid: bool, h: float, blocked_dependency_ids: List[str], aligned_relation_ids: List[str], cfg: SupportConfig) -> str:
+    if not plan_semantic_valid:
+        return "PLAN_UNCERTAIN"
+    if not aligned_relation_ids and blocked_dependency_ids:
+        return "UNALIGNED_TO_PLAN"
+    if blocked_dependency_ids or h < cfg.dependency_threshold:
+        return "DEPENDENCY_BLOCKED"
+    return "USABLE"
+
+
+def _overall_status(evidence_status: str, reasoning_status: str) -> str:
+    if evidence_status != "VERIFIED":
+        return evidence_status
+    if reasoning_status != "USABLE":
+        return reasoning_status
+    return "VERIFIED"
 
 
 def _rough_tokens(text: str) -> int:

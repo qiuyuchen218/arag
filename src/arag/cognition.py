@@ -38,11 +38,19 @@ class QuestionPlan:
     subgoals: List[Subgoal]
     constraints: List[str] = field(default_factory=list)
     variables: List[Dict[str, Any]] = field(default_factory=list)
+    given_bindings: Dict[str, str] = field(default_factory=dict)
     relations: List[Dict[str, Any]] = field(default_factory=list)
+    dependency_edges: List[Dict[str, str]] = field(default_factory=list)
     answer_spec: Dict[str, Any] = field(default_factory=dict)
+    planner_mode: str = "heuristic"
+    planner_confidence: float = 0.0
+    schema_valid: bool = True
+    semantic_valid: bool = True
+    unmapped_question_spans: List[str] = field(default_factory=list)
+    validation_warnings: List[str] = field(default_factory=list)
     generated_by: str = "heuristic_question_decomposer"
     analyzer_model: str = "heuristic"
-    analyzer_version: str = "v1"
+    analyzer_version: str = "v2.8"
     prompt_hash: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
@@ -74,12 +82,19 @@ def heuristic_question_plan(question: str, question_id: str = None) -> QuestionP
     else:
         answer_type, slots = "free_text", ["answer"]
 
-    variables, relations, constraints = _question_relations(q, question_id or q)
+    variables, relations, constraints, plan_meta = _question_relations(q, question_id or q)
     subgoals = []
     prev_required = None
     for relation in relations:
         sg_id = f"subgoal_{stable_hash(question_id or q, relation['relation_id'])}"
-        deps = [prev_required] if prev_required else []
+        relation_deps = list(relation.get("dependencies") or [])
+        deps = [
+            r.get("subgoal_id")
+            for r in relations
+            if r.get("relation_id") in relation_deps and r.get("subgoal_id")
+        ]
+        if not deps and prev_required and relation.get("relation_type") != "FALLBACK_PLACEHOLDER":
+            deps = [prev_required]
         subgoals.append(Subgoal(
             subgoal_id=sg_id,
             content=f"Resolve relation: {relation['subject_variable']} --{relation['predicate']}--> {relation['object_variable']}",
@@ -88,30 +103,40 @@ def heuristic_question_plan(question: str, question_id: str = None) -> QuestionP
             dependencies=deps,
         ))
         relation["subgoal_id"] = sg_id
-        relation["dependencies"] = deps
+        relation["subgoal_dependencies"] = deps
         prev_required = sg_id
     if "date" in slots:
         answer_relation_id = f"rel_{stable_hash(question_id or q, 'answer_date')}"
-        subgoals.append(Subgoal(
-            subgoal_id=f"subgoal_{stable_hash(question_id or q, 'answer_date')}",
-            content="Find the date that answers the question.",
-            expected_output_type="temporal",
-            required_constraints=["date_slot_filled"],
-            dependencies=[subgoals[-1].subgoal_id],
-        ))
-        relations.append({
-            "relation_id": answer_relation_id,
-            "subject_variable": relations[-1]["object_variable"] if relations else "target_entity",
-            "predicate": "answer_date",
-            "object_variable": "answer",
-            "required": True,
-            "dependencies": [relations[-1]["relation_id"]] if relations else [],
-            "status": "open",
-            "supporting_claim_ids": [],
-            "supporting_evidence_ids": [],
-            "subgoal_id": subgoals[-1].subgoal_id,
-            "expected_output_type": "temporal",
-        })
+        if not relations or relations[-1].get("predicate") not in {"abolished_date", "created_date", "founded_date", "established_date"}:
+            subgoals.append(Subgoal(
+                subgoal_id=f"subgoal_{stable_hash(question_id or q, 'answer_date')}",
+                content="Find the date that answers the question.",
+                expected_output_type="temporal",
+                required_constraints=["date_slot_filled"],
+                dependencies=[subgoals[-1].subgoal_id] if subgoals else [],
+            ))
+            relations.append({
+                "relation_id": answer_relation_id,
+                "subject_variable": relations[-1]["object_variable"] if relations else "target_entity",
+                "predicate": "answer_date",
+                "object_variable": "answer",
+                "relation_type": "answer_projection",
+                "required": True,
+                "dependencies": [relations[-1]["relation_id"]] if relations else [],
+                "status": "open",
+                "supporting_claim_ids": [],
+                "supporting_evidence_ids": [],
+                "subgoal_id": subgoals[-1].subgoal_id,
+                "expected_output_type": "temporal",
+            })
+    dependency_edges = [
+        {"source_relation_id": dep, "target_relation_id": rel["relation_id"]}
+        for rel in relations
+        for dep in (rel.get("dependencies") or [])
+    ]
+    given_bindings = _known_bindings_from_variables(variables)
+    schema_valid = bool(relations and subgoals and all(r.get("relation_id") and r.get("predicate") for r in relations))
+    semantic_valid = bool(schema_valid and plan_meta.get("semantic_valid", True))
     return QuestionPlan(
         question_id=str(question_id or stable_hash(q)),
         original_question=q,
@@ -120,35 +145,48 @@ def heuristic_question_plan(question: str, question_id: str = None) -> QuestionP
         subgoals=subgoals,
         constraints=constraints,
         variables=variables,
+        given_bindings=given_bindings,
         relations=relations,
-        answer_spec={"answer_type": answer_type, "required_slots": slots},
+        dependency_edges=dependency_edges,
+        answer_spec={"answer_type": answer_type, "required_slots": slots, "target_relation_id": relations[-1].get("relation_id") if relations else None},
+        planner_mode=plan_meta.get("planner_mode", "heuristic"),
+        planner_confidence=float(plan_meta.get("planner_confidence", 0.0)),
+        schema_valid=schema_valid,
+        semantic_valid=semantic_valid,
+        unmapped_question_spans=list(plan_meta.get("unmapped_question_spans", [])),
+        validation_warnings=list(plan_meta.get("validation_warnings", [])),
         prompt_hash=stable_hash(q, answer_type, slots),
     )
 
 
-def _question_relations(question: str, seed: str) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[str]]:
+def _question_relations(question: str, seed: str) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[str], Dict[str, Any]]:
     q = question or ""
     variables = [{"variable_id": "answer", "role": "answer", "binding_status": "UNKNOWN_VARIABLE"}]
     relations: List[Dict[str, Any]] = []
     constraints: List[str] = []
+    meta = {"planner_mode": "heuristic", "planner_confidence": 0.85, "semantic_valid": True, "validation_warnings": [], "unmapped_question_spans": []}
 
-    def add_relation(subject: str, predicate: str, obj: str, expected: str = "relation"):
+    def add_relation(subject: str, predicate: str, obj: str, expected: str = "relation", relation_type: str = "semantic_relation", deps: Optional[List[str]] = None, span: str = None):
         rid = f"rel_{stable_hash(seed, subject, predicate, obj)}"
         relations.append({
             "relation_id": rid,
             "subject_variable": subject,
             "predicate": predicate,
             "object_variable": obj,
+            "relation_type": relation_type,
             "required": True,
-            "dependencies": [],
+            "dependencies": list(deps or []),
             "identity_constraint": expected != "temporal",
             "answer_constraint": expected == "temporal",
             "status": "open",
             "supporting_claim_ids": [],
             "supporting_evidence_ids": [],
             "expected_output_type": expected,
+            "source_text_span": span or predicate.replace("_", " "),
+            "semantic_valid": relation_type != "FALLBACK_PLACEHOLDER",
         })
         constraints.append(rid)
+        return rid
 
     possessive = re.search(r"\b([A-Z][A-Za-z0-9_-]+(?:\s+[A-Z][A-Za-z0-9_-]+)*)'s\s+([a-z_ -]+?)\s+(?:abolished|created|founded|established)", q)
     if possessive:
@@ -160,15 +198,53 @@ def _question_relations(question: str, seed: str) -> tuple[List[Dict[str, Any]],
         ])
         variables[-2]["binding_status"] = "GIVEN_BINDING"
         variables[-1]["binding_status"] = "UNKNOWN_VARIABLE"
-        add_relation("person", relation_name, "target_entity", "entity")
-        add_relation("target_entity", "abolished_date" if "abolished" in q.lower() else "created_date", "answer", "temporal")
-        return variables, relations, constraints
+        r1 = add_relation("person", relation_name, "target_entity", "entity", span=possessive.group(0))
+        add_relation("target_entity", "abolished_date" if "abolished" in q.lower() else "created_date", "answer", "temporal", deps=[r1], span=possessive.group(0))
+        return variables, relations, constraints, meta
 
-    clauses = [
-        ("region_immediately_north", "region where Israel is located"),
-        ("battle_location", "location of the Battle of Qurah and Umm al Maradim"),
-        ("creation_date", "target region"),
-    ]
+    simple_loc = re.search(r"\b(?:where|what country)\b.*?\bis\s+(.+?)\s+(?:located|based)\b", q, flags=re.I)
+    if simple_loc:
+        entity = _clean_question_entity(simple_loc.group(1))
+        variables.extend([
+            {"variable_id": "target_entity", "role": "given_entity", "value": entity, "binding_status": "GIVEN_BINDING"},
+        ])
+        add_relation("target_entity", "located_in", "answer", "location", span=simple_loc.group(0))
+        return variables, relations, constraints, meta
+
+    mother = re.search(r"\bwho\b.*?\bis\s+([A-Z][A-Za-z0-9_-]+(?:\s+[A-Z][A-Za-z0-9_-]+)*)'s\s+mother", q, flags=re.I)
+    if mother:
+        person = mother.group(1).strip()
+        variables.extend([
+            {"variable_id": "person", "role": "given_entity", "value": person, "binding_status": "GIVEN_BINDING"},
+        ])
+        add_relation("person", "mother", "answer", "person", span=mother.group(0))
+        return variables, relations, constraints, meta
+
+    created = re.search(r"\bwhen\b.*?\bwas\s+(.+?)\s+(?:created|founded|established)\b", q, flags=re.I)
+    if created:
+        entity = _clean_question_entity(created.group(1))
+        binding_status = "UNKNOWN_VARIABLE" if re.search(r"\b(?:target|place|thing|region|location)\b", entity, re.I) else "GIVEN_BINDING"
+        variables.extend([
+            {"variable_id": "target_entity", "role": "given_entity" if binding_status == "GIVEN_BINDING" else "answer_subject", "value": entity if binding_status == "GIVEN_BINDING" else None, "description": entity, "binding_status": binding_status},
+        ])
+        predicate = "founded_date" if "founded" in created.group(0).lower() else ("established_date" if "established" in created.group(0).lower() else "created_date")
+        rid = add_relation("target_entity", predicate, "answer", "temporal", span=created.group(0))
+        if binding_status == "UNKNOWN_VARIABLE":
+            relations[-1]["identity_constraint"] = True
+        return variables, relations, constraints, meta
+
+    abolished = re.search(r"\bwhen\b.*?\bwas\s+(.+?)\s+abolished\b", q, flags=re.I)
+    if abolished:
+        entity = _clean_question_entity(abolished.group(1))
+        binding_status = "UNKNOWN_VARIABLE" if re.search(r"\b(?:target|place|thing|region|location)\b", entity, re.I) else "GIVEN_BINDING"
+        variables.extend([
+            {"variable_id": "target_entity", "role": "given_entity" if binding_status == "GIVEN_BINDING" else "answer_subject", "value": entity if binding_status == "GIVEN_BINDING" else None, "description": entity, "binding_status": binding_status},
+        ])
+        add_relation("target_entity", "abolished_date", "answer", "temporal", span=abolished.group(0))
+        if binding_status == "UNKNOWN_VARIABLE":
+            relations[-1]["identity_constraint"] = True
+        return variables, relations, constraints, meta
+
     if "immediately north" in q.lower() and "battle" in q.lower():
         variables.extend([
             {"variable_id": "base_region", "role": "given_constraint", "description": "region where Israel is located"},
@@ -177,22 +253,43 @@ def _question_relations(question: str, seed: str) -> tuple[List[Dict[str, Any]],
         ])
         for v in variables[-3:]:
             v["binding_status"] = "UNKNOWN_VARIABLE"
-        add_relation("base_region", "located_region_of", "Israel", "location")
-        add_relation("battle_location", "location_of_battle", "Battle of Qurah and Umm al Maradim", "location")
-        add_relation("target_region", "immediately_north_of", "base_region", "location")
-        add_relation("target_region", "contains_or_matches_battle_location_constraint", "battle_location", "location")
-        add_relation("target_region", "created_date", "answer", "temporal")
-        return variables, relations, constraints
+        r1 = add_relation("base_region", "located_region_of", "Israel", "location", span="region where Israel is located")
+        r2 = add_relation("battle_location", "location_of_battle", "Battle of Qurah and Umm al Maradim", "location", span="location of the Battle of Qurah and Umm al Maradim")
+        r3 = add_relation("target_region", "immediately_north_of", "base_region", "location", deps=[r1], span="region immediately north")
+        r4 = add_relation("target_region", "contains_or_matches_battle_location_constraint", "battle_location", "location", deps=[r2], span="location constraint")
+        add_relation("target_region", "created_date", "answer", "temporal", deps=[r3, r4], span="created")
+        return variables, relations, constraints, meta
 
     variables.append({"variable_id": "target_entity", "role": "answer_subject", "binding_status": "UNKNOWN_VARIABLE"})
-    add_relation("question", "identify_target_entity", "target_entity", "entity")
-    return variables, relations, constraints
+    meta.update({
+        "planner_mode": "heuristic_low_confidence_llm_required",
+        "planner_confidence": 0.2,
+        "semantic_valid": False,
+        "validation_warnings": ["fallback_placeholder_relation_not_semantically_grounded"],
+        "unmapped_question_spans": [q],
+    })
+    add_relation("question", "open_relation", "target_entity", "entity", relation_type="FALLBACK_PLACEHOLDER", span=q)
+    return variables, relations, constraints, meta
+
+
+def _clean_question_entity(text: str) -> str:
+    text = re.sub(r"\b(?:the|a|an|region|country|city|place|person|organization)\b", " ", str(text or ""), flags=re.I)
+    return re.sub(r"\s+", " ", text).strip(" ?.,")
+
+
+def _known_bindings_from_variables(variables: List[Dict[str, Any]]) -> Dict[str, str]:
+    return {
+        str(v.get("variable_id")): str(v.get("value"))
+        for v in variables
+        if v.get("binding_status") == "GIVEN_BINDING" and v.get("value")
+    }
 
 
 PREDICATE_TERMS = {
     "abolished", "abolish", "created", "create", "founded", "found", "established", "establish",
     "date", "when", "location", "birthplace", "born", "created_date", "abolished_date",
-    "established_date", "founded_date", "history", "country", "region", "city", "county",
+    "established_date", "founded_date", "history", "country", "region", "city",
+    "who", "what", "when", "where", "which", "why", "how",
 }
 
 
@@ -208,12 +305,18 @@ class QueryIntent:
     target_subgoal_id: Optional[str]
     target_relation_id: Optional[str]
     predicate: Optional[str]
+    aligned_subgoal_id: Optional[str] = None
+    aligned_relation_id: Optional[str] = None
     known_bindings: Dict[str, str] = field(default_factory=dict)
     unknown_variable: Optional[str] = None
     candidate_entities: List[str] = field(default_factory=list)
+    entity_spans: List[Dict[str, Any]] = field(default_factory=list)
+    canonicalization_confidence: float = 0.0
     query_mode: str = "unknown"
     epistemic_action: str = "explore"
     commitment_level: str = "exploratory"
+    semantic_valid: bool = False
+    alignment_score: float = 0.0
     parser_mode: str = "heuristic"
     parser_confidence: float = 0.0
     parse_warnings: List[str] = field(default_factory=list)
@@ -266,7 +369,6 @@ class CommitmentEvent:
 def canonicalize_entity(text: str) -> Optional[str]:
     text = re.sub(r"[{}]+", " ", str(text or ""))
     text = re.sub(r"\b(?:chunk|doc|document|span|id|ids|read chunks?)\s*[:#]?\s*\d+\b", " ", text, flags=re.I)
-    text = re.sub(r"\b\d+\b", " ", text)
     pieces = []
     for token in re.split(r"\s+", text.strip()):
         clean = re.sub(r"^[^\w]+|[^\w]+$", "", token)
@@ -295,15 +397,17 @@ def parse_query_intent(
     normalized = re.sub(r"\s+", " ", raw).strip()
     lower = normalized.lower()
     warnings: List[str] = []
-    relation = _best_relation_for_query(question_plan, lower)
+    relation, alignment_score = _best_relation_for_query(question_plan, lower)
     text_predicate = _predicate_from_text(lower)
     predicate = text_predicate or (relation.get("predicate") if relation else None)
-    if text_predicate and relation and relation.get("predicate") == "identify_target_entity":
+    if text_predicate and relation and relation.get("relation_type") == "FALLBACK_PLACEHOLDER":
         relation = None
-    candidate_entities = _candidate_entities_from_query(normalized, predicate)
+        alignment_score = 0.0
+    candidate_entities, entity_spans, canon_conf = _candidate_entities_from_query(normalized, predicate)
     if tool_name == "read_chunk":
         mode, action, level = "unknown", "explore", "exploratory"
         candidate_entities = []
+        entity_spans = []
         warnings.append("read_intent_no_entity_proposal")
     elif predicate in {"abolished_date", "created_date", "answer_date", "established", "created", "abolished"}:
         mode, action = "answer_lookup", "test"
@@ -314,7 +418,14 @@ def parse_query_intent(
         mode, action, level = "entity_discovery", "propose", "exploratory"
     else:
         mode, action, level = "broad_exploration", "explore", "exploratory"
-    confidence = 0.8 if relation and (candidate_entities or tool_name == "read_chunk") else (0.55 if predicate or candidate_entities else 0.25)
+    relation_semantic_valid = bool(relation and relation.get("relation_type") != "FALLBACK_PLACEHOLDER" and relation.get("semantic_valid", True))
+    semantic_valid = bool(question_plan.semantic_valid and relation_semantic_valid and (predicate or candidate_entities or tool_name == "read_chunk"))
+    if relation and not relation_semantic_valid:
+        warnings.append("aligned_relation_is_fallback_placeholder")
+    if not predicate and relation and question_plan.semantic_valid:
+        semantic_valid = False
+        warnings.append("no_predicate_for_open_relation")
+    confidence = 0.8 if semantic_valid and (candidate_entities or tool_name == "read_chunk") else (0.55 if predicate or candidate_entities else 0.25)
     return QueryIntent(
         query_intent_id=f"qi_{stable_hash(branch_id, source_plan_query_id, generated_by_llm_call_id, normalized, step_index)}",
         branch_id=branch_id,
@@ -325,13 +436,19 @@ def parse_query_intent(
         normalized_query=normalized,
         target_subgoal_id=relation.get("subgoal_id") if relation else (question_plan.subgoals[0].subgoal_id if question_plan.subgoals else None),
         target_relation_id=relation.get("relation_id") if relation else None,
+        aligned_subgoal_id=relation.get("subgoal_id") if relation else None,
+        aligned_relation_id=relation.get("relation_id") if relation else None,
         predicate=predicate,
         known_bindings=_known_bindings(question_plan),
         unknown_variable=relation.get("object_variable") if relation else None,
         candidate_entities=candidate_entities,
+        entity_spans=entity_spans,
+        canonicalization_confidence=canon_conf,
         query_mode=mode,
         epistemic_action=action,
         commitment_level=level,
+        semantic_valid=semantic_valid,
+        alignment_score=alignment_score,
         parser_confidence=confidence,
         parse_warnings=warnings,
     )
@@ -345,16 +462,23 @@ def _known_bindings(question_plan: QuestionPlan) -> Dict[str, str]:
     }
 
 
-def _best_relation_for_query(question_plan: QuestionPlan, lower_query: str) -> Optional[Dict[str, Any]]:
+def _best_relation_for_query(question_plan: QuestionPlan, lower_query: str) -> tuple[Optional[Dict[str, Any]], float]:
     best = None
     best_score = 0
     for rel in question_plan.relations:
         pred = str(rel.get("predicate", ""))
         terms = [t for t in re.split(r"[_\s]+", pred.lower()) if t]
         score = sum(1 for t in terms if t in lower_query)
+        subject = str(rel.get("subject_variable", "")).lower()
+        obj = str(rel.get("object_variable", "")).lower()
+        score += 1 if subject and subject in lower_query else 0
+        score += 1 if obj and obj in lower_query else 0
         if score > best_score:
             best, best_score = rel, score
-    return best
+    if best_score <= 0:
+        return None, 0.0
+    max_score = max(1, len(re.split(r"[_\s]+", str(best.get("predicate", "")))) if best else 1)
+    return best, min(1.0, best_score / max_score)
 
 
 def _predicate_from_text(lower_query: str) -> Optional[str]:
@@ -369,19 +493,21 @@ def _predicate_from_text(lower_query: str) -> Optional[str]:
     return None
 
 
-def _candidate_entities_from_query(query: str, predicate: str = None) -> List[str]:
+def _candidate_entities_from_query(query: str, predicate: str = None) -> tuple[List[str], List[Dict[str, Any]], float]:
     text = re.sub(r"['\"]", " ", query or "")
     text = re.sub(r"\b(?:when|where|who|what|was|were|is|are|the|of|in|for|or|and|as|a|an|to)\b", " ", text, flags=re.I)
     if predicate:
         for term in re.split(r"[_\s]+", predicate):
             text = re.sub(rf"\b{re.escape(term)}\b", " ", text, flags=re.I)
-    text = re.sub(r"\b(?:created|founded|established|abolished|birthplace|location|date|history|country|region|city|county)\b", " ", text, flags=re.I)
+    text = re.sub(r"\b(?:created|founded|established|abolished|birthplace|location|date|history|country|region|city)\b", " ", text, flags=re.I)
     candidates = []
+    spans: List[Dict[str, Any]] = []
     for match in re.finditer(r"\b[A-Z][A-Za-z0-9_-]*(?:\s+[A-Z][A-Za-z0-9_-]*){0,5}\b", text):
         entity = canonicalize_entity(match.group(0))
         if entity and entity not in candidates:
             candidates.append(entity)
-    return candidates
+            spans.append({"text": match.group(0), "start": match.start(), "end": match.end(), "canonical": entity, "confidence": 0.8})
+    return candidates, spans, 0.8 if candidates else 0.0
 
 
 class OnlineHypothesisTracker:
@@ -734,12 +860,154 @@ class AnswerAssessment:
     ambiguity: str = "none"
     target_binding_valid: bool = False
     support_valid: bool = False
+    relation_id: Optional[str] = None
+    binding_valid: bool = False
+    support_status: str = "UNKNOWN"
 
     def to_dict(self) -> Dict[str, Any]:
         return clean_json(asdict(self))
 
 
-def assess_answer(question_plan: QuestionPlan, answer: str, claim_assessments: List[Dict[str, Any]]) -> AnswerAssessment:
+@dataclass
+class StructuredProposition:
+    proposition_id: str
+    subject: Optional[str]
+    predicate: str
+    object: Optional[str]
+    value: Optional[str]
+    value_type: str
+    source_type: str
+    source_id: Optional[str]
+    evidence_span_ids: List[str] = field(default_factory=list)
+    claim_ids: List[str] = field(default_factory=list)
+    confidence: float = 0.0
+    extraction_mode: str = "heuristic"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return clean_json(asdict(self))
+
+
+@dataclass
+class RelationGrounding:
+    grounding_id: str
+    relation_id: str
+    subgoal_id: Optional[str]
+    status: str
+    supporting_proposition_ids: List[str] = field(default_factory=list)
+    supporting_evidence_ids: List[str] = field(default_factory=list)
+    supporting_claim_ids: List[str] = field(default_factory=list)
+    confidence: float = 0.0
+    reason: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return clean_json(asdict(self))
+
+
+def extract_structured_propositions(
+    question_plan: QuestionPlan,
+    evidence_spans: List[Any],
+    claim_assessments: List[Dict[str, Any]],
+    final_answer: str = "",
+) -> List[Dict[str, Any]]:
+    propositions: List[StructuredProposition] = []
+    known_entities = {v.lower(): v for v in _known_bindings_from_variables(question_plan.variables).values()}
+    for span in evidence_spans or []:
+        text = getattr(span, "text", "") or ""
+        sid = getattr(span, "span_id", None)
+        for rel in question_plan.relations:
+            predicate = str(rel.get("predicate", ""))
+            if _text_matches_relation(text, rel, known_entities):
+                value = _extract_value_for_predicate(text, predicate)
+                propositions.append(StructuredProposition(
+                    proposition_id=f"prop_{stable_hash('span', sid, rel.get('relation_id'), value or text[:80])}",
+                    subject=_relation_subject_label(question_plan, rel, text),
+                    predicate=predicate,
+                    object=str(rel.get("object_variable") or ""),
+                    value=value,
+                    value_type=rel.get("expected_output_type", "free_text"),
+                    source_type="evidence_span",
+                    source_id=sid,
+                    evidence_span_ids=[sid] if sid else [],
+                    confidence=0.7 if value or rel.get("expected_output_type") != "temporal" else 0.45,
+                ))
+    for assessment in claim_assessments or []:
+        claim = assessment.get("claim", {})
+        content = claim.get("content", "")
+        for rel_id in claim.get("aligned_relation_ids", []) or claim.get("resolves_relation_ids", []) or []:
+            rel = question_plan.relation_by_id().get(rel_id)
+            if not rel:
+                continue
+            value = _extract_value_for_predicate(content, str(rel.get("predicate", "")))
+            propositions.append(StructuredProposition(
+                proposition_id=f"prop_{stable_hash('claim', claim.get('claim_id'), rel_id, value or content[:80])}",
+                subject=_relation_subject_label(question_plan, rel, content),
+                predicate=str(rel.get("predicate", "")),
+                object=str(rel.get("object_variable") or ""),
+                value=value,
+                value_type=rel.get("expected_output_type", "free_text"),
+                source_type="claim",
+                source_id=claim.get("claim_id"),
+                evidence_span_ids=list(assessment.get("evidence_set_span_ids") or []),
+                claim_ids=[claim.get("claim_id")] if claim.get("claim_id") else [],
+                confidence=0.85 if assessment.get("evidence_status") == "VERIFIED" else 0.45,
+            ))
+    for match in DATE_RE.finditer(final_answer or ""):
+        rel = next((r for r in reversed(question_plan.relations) if r.get("expected_output_type") == "temporal"), None)
+        propositions.append(StructuredProposition(
+            proposition_id=f"prop_{stable_hash('answer', match.group(0), match.start())}",
+            subject=str(rel.get("subject_variable")) if rel else None,
+            predicate=str(rel.get("predicate")) if rel else "answer_date",
+            object="answer",
+            value=match.group(0),
+            value_type="temporal",
+            source_type="final_answer",
+            source_id="final_answer",
+            confidence=0.55,
+        ))
+    dedup = {p.proposition_id: p for p in propositions}
+    return [p.to_dict() for p in dedup.values()]
+
+
+def ground_relations(question_plan: QuestionPlan, propositions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    groundings: List[RelationGrounding] = []
+    by_predicate = {}
+    for prop in propositions or []:
+        by_predicate.setdefault(str(prop.get("predicate")), []).append(prop)
+    for rel in question_plan.relations:
+        rel_id = rel.get("relation_id")
+        props = by_predicate.get(str(rel.get("predicate")), [])
+        supporting = [p for p in props if _proposition_grounds_relation(question_plan, rel, p)]
+        evidence_ids = list(dict.fromkeys(eid for p in supporting for eid in (p.get("evidence_span_ids") or []) if eid))
+        claim_ids = list(dict.fromkeys(cid for p in supporting for cid in (p.get("claim_ids") or []) if cid))
+        if not question_plan.semantic_valid:
+            status, confidence, reason = "PLAN_UNCERTAIN", 0.0, "question plan is not semantically valid"
+        elif supporting and (rel.get("expected_output_type") != "temporal" or any(p.get("value") for p in supporting)):
+            status, confidence, reason = "SATISFIED", max(float(p.get("confidence", 0) or 0) for p in supporting), "relation grounded by structured proposition"
+        elif supporting:
+            status, confidence, reason = "PARTIALLY_GROUNDED", max(float(p.get("confidence", 0) or 0) for p in supporting), "relation mentioned but required value not grounded"
+        else:
+            status, confidence, reason = "UNGROUNDED", 0.0, "no proposition matched relation predicate and bindings"
+        groundings.append(RelationGrounding(
+            grounding_id=f"ground_{stable_hash(rel_id, [p.get('proposition_id') for p in supporting], status)}",
+            relation_id=str(rel_id),
+            subgoal_id=rel.get("subgoal_id"),
+            status=status,
+            supporting_proposition_ids=[p.get("proposition_id") for p in supporting],
+            supporting_evidence_ids=evidence_ids,
+            supporting_claim_ids=claim_ids,
+            confidence=confidence,
+            reason=reason,
+        ).to_dict())
+    return groundings
+
+
+def assess_answer(
+    question_plan: QuestionPlan,
+    answer: str,
+    claim_assessments: List[Dict[str, Any]],
+    relation_groundings: Optional[List[Dict[str, Any]]] = None,
+    resolved_subgoals: Optional[List[Dict[str, Any]]] = None,
+) -> AnswerAssessment:
     slots: Dict[str, Any] = {}
     candidate_answers: List[Dict[str, Any]] = []
     answer_text = answer or ""
@@ -750,9 +1018,13 @@ def assess_answer(question_plan: QuestionPlan, answer: str, claim_assessments: L
                 "normalized_value": _normalize_date_like(match.group(0)),
                 "answer_type": "temporal",
                 "target_entity": None,
-                "relation": "answer_date",
+                "relation": None,
+                "relation_id": None,
+                "predicate": None,
                 "source_claim_id": None,
                 "support_status": "UNKNOWN",
+                "binding_valid": False,
+                "evidence_ids": [],
                 "directly_asserted": _is_direct_answer_position(answer_text, match.start()),
                 "hedged": _is_hedged(answer_text, match.start()),
                 "position": match.start(),
@@ -772,13 +1044,32 @@ def assess_answer(question_plan: QuestionPlan, answer: str, claim_assessments: L
                 critical = claim.get("claim_id")
             if assessment.get("status") == "VERIFIED":
                 support_valid = True
+            for candidate in candidate_answers:
+                if candidate["value"] in claim.get("content", ""):
+                    rel_id = (claim.get("aligned_relation_ids") or claim.get("resolves_relation_ids") or [None])[-1]
+                    candidate.update({
+                        "relation_id": rel_id,
+                        "predicate": _relation_predicate(question_plan, rel_id),
+                        "source_claim_id": claim.get("claim_id"),
+                        "support_status": assessment.get("evidence_status", assessment.get("status", "UNKNOWN")),
+                        "binding_valid": assessment.get("reasoning_status") not in {"DEPENDENCY_BLOCKED", "UNALIGNED_TO_PLAN", "PLAN_UNCERTAIN"},
+                        "evidence_ids": list(assessment.get("evidence_set_span_ids") or []),
+                    })
     normalized_values = {c["normalized_value"] for c in candidate_answers}
     ambiguity = "multiple_distinct_answers" if len(normalized_values) > 1 else "none"
     selected = None
     if candidate_answers and ambiguity == "none":
         direct = [c for c in candidate_answers if c["directly_asserted"] and not c["hedged"]]
         selected = direct[0] if direct else candidate_answers[0]
-    target_binding_valid = all(sg.status == "resolved" for sg in question_plan.subgoals if sg.required and sg.expected_output_type != "temporal")
+    subgoal_rows = resolved_subgoals if resolved_subgoals is not None else [asdict(sg) for sg in question_plan.subgoals]
+    target_binding_valid = all(str(sg.get("status", "")).upper() in {"RESOLVED", "SATISFIED"} for sg in subgoal_rows if sg.get("required") and sg.get("expected_output_type") != "temporal")
+    if relation_groundings:
+        temporal_grounded = any(g.get("status") == "SATISFIED" for g in relation_groundings if _relation_predicate(question_plan, g.get("relation_id")) in {"created_date", "abolished_date", "founded_date", "established_date", "answer_date"})
+        support_valid = support_valid or temporal_grounded
+    if not question_plan.semantic_valid:
+        status = "PLAN_UNCERTAIN"
+    else:
+        status = None
     complete = (
         coverage >= 1.0
         and critical is not None
@@ -788,14 +1079,21 @@ def assess_answer(question_plan: QuestionPlan, answer: str, claim_assessments: L
         and selected is not None
         and not abstained
     )
-    if ambiguity != "none":
+    if status:
+        pass
+    elif ambiguity != "none":
         status = "AMBIGUOUS"
     elif complete:
         status = "COMPLETE"
     elif critical is not None and not support_valid:
         status = "UNSUPPORTED"
+    elif not target_binding_valid:
+        status = "TARGET_UNRESOLVED"
     else:
         status = "INCOMPLETE"
+    if selected:
+        selected["binding_valid"] = target_binding_valid
+        selected["support_status"] = "VERIFIED" if support_valid else selected.get("support_status", "UNKNOWN")
     return AnswerAssessment(
         expected_answer_type=question_plan.expected_answer_type,
         required_slots=question_plan.required_answer_slots,
@@ -812,7 +1110,45 @@ def assess_answer(question_plan: QuestionPlan, answer: str, claim_assessments: L
         ambiguity=ambiguity,
         target_binding_valid=target_binding_valid,
         support_valid=support_valid,
+        relation_id=selected.get("relation_id") if selected else None,
+        binding_valid=target_binding_valid,
+        support_status="VERIFIED" if support_valid else ("PLAN_UNCERTAIN" if not question_plan.semantic_valid else "UNKNOWN"),
     )
+
+
+def _text_matches_relation(text: str, rel: Dict[str, Any], known_entities: Dict[str, str]) -> bool:
+    lower = (text or "").lower()
+    predicate_terms = [t for t in re.split(r"[_\s]+", str(rel.get("predicate", "")).lower()) if t and t not in {"date", "answer"}]
+    predicate_match = any(t in lower for t in predicate_terms) or (rel.get("expected_output_type") == "temporal" and DATE_RE.search(text or ""))
+    binding_values = [v.lower() for v in known_entities.values()]
+    binding_match = not binding_values or any(v in lower for v in binding_values)
+    return bool(predicate_match and binding_match)
+
+
+def _extract_value_for_predicate(text: str, predicate: str) -> Optional[str]:
+    if predicate in {"abolished_date", "created_date", "founded_date", "established_date", "answer_date"}:
+        match = DATE_RE.search(text or "")
+        return match.group(0) if match else None
+    return None
+
+
+def _relation_subject_label(question_plan: QuestionPlan, rel: Dict[str, Any], text: str) -> Optional[str]:
+    subject = str(rel.get("subject_variable") or "")
+    bindings = _known_bindings_from_variables(question_plan.variables)
+    return bindings.get(subject) or subject or canonicalize_entity(text)
+
+
+def _proposition_grounds_relation(question_plan: QuestionPlan, rel: Dict[str, Any], prop: Dict[str, Any]) -> bool:
+    if prop.get("predicate") != rel.get("predicate"):
+        return False
+    if rel.get("expected_output_type") == "temporal" and not prop.get("value"):
+        return False
+    return True
+
+
+def _relation_predicate(question_plan: QuestionPlan, relation_id: Optional[str]) -> Optional[str]:
+    rel = question_plan.relation_by_id().get(relation_id)
+    return rel.get("predicate") if rel else None
 
 
 def _normalize_date_like(value: str) -> str:
@@ -832,7 +1168,9 @@ def _is_hedged(text: str, pos: int) -> bool:
 def infer_failure_types(answer_assessment: Dict[str, Any], hypothesis_assessments: List[Dict[str, Any]], subgoals: List[Dict[str, Any]]) -> List[str]:
     failures = []
     status = answer_assessment.get("completeness_status")
-    if status == "INCOMPLETE":
+    if status == "PLAN_UNCERTAIN":
+        failures.append("PLAN_UNCERTAIN")
+    elif status == "INCOMPLETE":
         failures.append("ANSWER_MISSING")
     elif status == "UNSUPPORTED":
         failures.append("ANSWER_UNSUPPORTED")

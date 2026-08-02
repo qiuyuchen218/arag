@@ -33,6 +33,8 @@ from arag.cognition import (
     assess_answer,
     build_candidate_constraint_matrix,
     build_shadow_repair_plan,
+    extract_structured_propositions,
+    ground_relations,
     infer_failure_types,
     parse_query_intent,
 )
@@ -100,16 +102,45 @@ def _claim_local_dependencies(claim_text: str, question_plan) -> List[str]:
     return list(dict.fromkeys(deps))
 
 
-def _resolve_subgoals(question_plan, assessments: List[Dict[str, Any]], answer_assessment: Dict[str, Any]) -> List[Dict[str, Any]]:
-    verified_by_dep: Dict[str, List[str]] = {}
+def _align_claim_to_relations(claim_text: str, question_plan) -> List[str]:
+    lower = (claim_text or "").lower()
+    aligned = []
+    for rel in question_plan.relations:
+        predicate_terms = [t for t in re.split(r"[_\s]+", str(rel.get("predicate", "")).lower()) if t and t not in {"date", "answer"}]
+        relation_match = any(t in lower for t in predicate_terms)
+        if not relation_match and rel.get("expected_output_type") == "temporal" and re.search(r"\b\d{3,4}\b", lower):
+            relation_match = True
+        if relation_match:
+            aligned.append(rel.get("relation_id"))
+    return list(dict.fromkeys([a for a in aligned if a]))
+
+
+def _relation_dependency_subgoals(question_plan, relation_ids: List[str]) -> List[str]:
+    relation_by_id = question_plan.relation_by_id()
+    deps = []
+    for rel_id in relation_ids:
+        rel = relation_by_id.get(rel_id, {})
+        for dep_rel_id in rel.get("dependencies", []) or []:
+            dep_sg = relation_by_id.get(dep_rel_id, {}).get("subgoal_id")
+            if dep_sg:
+                deps.append(dep_sg)
+    return list(dict.fromkeys(deps))
+
+
+def _resolve_subgoals(question_plan, assessments: List[Dict[str, Any]], answer_assessment: Dict[str, Any], relation_groundings: List[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    grounded_by_subgoal: Dict[str, List[Dict[str, Any]]] = {}
+    for grounding in relation_groundings or []:
+        if grounding.get("subgoal_id"):
+            grounded_by_subgoal.setdefault(grounding["subgoal_id"], []).append(grounding)
+    verified_by_resolution: Dict[str, List[str]] = {}
     for assessment in assessments:
-        if assessment.get("status") != "VERIFIED":
+        if assessment.get("evidence_status") != "VERIFIED":
             continue
         claim = assessment.get("claim", {})
         if not assessment.get("evidence_set_span_ids"):
             continue
-        for dep in claim.get("dependencies", []) or []:
-            verified_by_dep.setdefault(dep, []).append(claim.get("claim_id"))
+        for sg_id in claim.get("resolves_subgoal_ids", []) or []:
+            verified_by_resolution.setdefault(sg_id, []).append(claim.get("claim_id"))
 
     status_by_id: Dict[str, str] = {}
     subgoal_dicts = []
@@ -117,13 +148,18 @@ def _resolve_subgoals(question_plan, assessments: List[Dict[str, Any]], answer_a
         data = sg.__dict__.copy()
         deps = data.get("dependencies") or []
         deps_resolved = all(status_by_id.get(dep) == "RESOLVED" for dep in deps)
-        resolver_ids = verified_by_dep.get(data["subgoal_id"], [])
+        resolver_ids = verified_by_resolution.get(data["subgoal_id"], [])
+        groundings = grounded_by_subgoal.get(data["subgoal_id"], [])
+        grounded = any(g.get("status") == "SATISFIED" for g in groundings)
+        partial = any(g.get("status") in {"PARTIALLY_GROUNDED", "SATISFIED"} for g in groundings)
         if deps and not deps_resolved:
             data["status"] = "BLOCKED"
-        elif resolver_ids:
+        elif grounded or resolver_ids:
             data["status"] = "RESOLVED"
             data["resolved_by_claim_ids"] = resolver_ids
             data["satisfied_constraints"] = list(dict.fromkeys((data.get("satisfied_constraints") or []) + data.get("required_constraints", [])))
+        elif partial:
+            data["status"] = "PARTIALLY_RESOLVED"
         elif data.get("expected_output_type") == "temporal" and answer_assessment.get("slot_coverage", 0) > 0 and not deps:
             data["status"] = "UNCERTAIN"
         elif data.get("required"):
@@ -442,10 +478,22 @@ class BatchRunner:
             if rel.get("identity_constraint") and rel.get("subgoal_id")
         ]
         for claim in claims:
+            aligned_relation_ids = _align_claim_to_relations(claim.content, question_plan)
+            resolves_subgoal_ids = [
+                subgoal_by_relation.get(rel_id)
+                for rel_id in aligned_relation_ids
+                if subgoal_by_relation.get(rel_id)
+            ]
+            claim.aligned_relation_ids = aligned_relation_ids
+            claim.resolves_subgoal_ids = list(dict.fromkeys(resolves_subgoal_ids))
             if claim.claim_type == "answer_claim":
-                claim.dependencies = list(dict.fromkeys(identity_subgoal_ids + answer_subgoal_ids))
+                claim.dependencies = _relation_dependency_subgoals(question_plan, aligned_relation_ids) or list(dict.fromkeys(identity_subgoal_ids))
+                if not claim.dependencies and question_plan.subgoals:
+                    claim.dependencies = [question_plan.subgoals[0].subgoal_id]
             elif claim.criticality > 0:
-                claim.dependencies = _claim_local_dependencies(claim.content, question_plan) or identity_subgoal_ids[:1]
+                claim.dependencies = _relation_dependency_subgoals(question_plan, aligned_relation_ids)
+                if not claim.dependencies and not aligned_relation_ids:
+                    claim.dependencies = [question_plan.subgoals[0].subgoal_id] if question_plan.subgoals else []
         visible_ids = list(dict.fromkeys(delivered_span_ids))
         tracker = OnlineHypothesisTracker(question_plan)
         query_intents = []
@@ -525,14 +573,26 @@ class BatchRunner:
         assessments = []
         for claim in claims:
             parent_supports = [dep_supports.get(dep, 0.0) for dep in claim.dependencies] if claim.dependencies else None
-            assessments.append(scorer.score(claim, spans, delivered_span_ids, parent_supports=parent_supports))
+            blocked_dep_ids = [dep for dep in (claim.dependencies or []) if dep_supports.get(dep, 0.0) < cfg.dependency_threshold]
+            assessments.append(scorer.score(
+                claim,
+                spans,
+                delivered_span_ids,
+                parent_supports=parent_supports,
+                dependency_ids=claim.dependencies,
+                blocked_dependency_ids=blocked_dep_ids,
+                plan_semantic_valid=question_plan.semantic_valid,
+            ))
         for assessment in assessments:
             claim_node_id = trace_logger.add_claim_assessment(assessment, generated_by=answer_node)
             assessment["claim_node_id"] = claim_node_id
             assessment["evidence_set_node_id"] = assessment.get("best_evidence_set", {}).get("evidence_set_id")
-        answer_assessment = assess_answer(question_plan, result.get("answer", ""), assessments).to_dict()
-        subgoal_assessments = _resolve_subgoals(question_plan, assessments, answer_assessment)
-        unresolved_required = [sg["subgoal_id"] for sg in subgoal_assessments if sg.get("required") and sg.get("status") != "resolved"]
+        structured_propositions = extract_structured_propositions(question_plan, spans, assessments, result.get("answer", ""))
+        relation_groundings = ground_relations(question_plan, structured_propositions)
+        subgoal_assessments = _resolve_subgoals(question_plan, assessments, {"slot_coverage": 0}, relation_groundings)
+        answer_assessment = assess_answer(question_plan, result.get("answer", ""), assessments, relation_groundings, subgoal_assessments).to_dict()
+        subgoal_assessments = _resolve_subgoals(question_plan, assessments, answer_assessment, relation_groundings)
+        unresolved_required = [sg["subgoal_id"] for sg in subgoal_assessments if sg.get("required") and str(sg.get("status", "")).upper() != "RESOLVED"]
         failure_types = infer_failure_types(answer_assessment, hypothesis_assessments, subgoal_assessments)
         root_bad = failure_frontier(assessments)
         final_support = min((a["raw_score"] for a in assessments if a["claim"].get("criticality", 1.0) > 0), default=None)
@@ -626,6 +686,9 @@ class BatchRunner:
             "query_intents": [qi.__dict__ for qi in query_intents],
             "commitment_events": commitment_events,
             "candidate_constraint_matrix": candidate_matrix,
+            "structured_propositions": structured_propositions,
+            "relation_groundings": relation_groundings,
+            "failure_frontier": root_bad,
             "final_claim_support": final_support,
             "root_bad_claims": root_bad,
             "root_bad_hypotheses": root_bad_hypotheses,

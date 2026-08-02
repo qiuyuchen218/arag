@@ -466,6 +466,9 @@ class TraceGraph:
         for dep in claim.get("dependencies", []) or []:
             if any(n["id"] == dep for n in self.nodes):
                 self.add_edge(node_id, dep, "depends_on", {"timestamp": self.timestamp()})
+        for subgoal_id in claim.get("resolves_subgoal_ids", []) or []:
+            if any(n["id"] == subgoal_id for n in self.nodes):
+                self.add_edge(node_id, subgoal_id, "answers_subgoal", {"timestamp": self.timestamp()})
         return node_id
 
     def add_subgoal_node(self, subgoal: Dict[str, Any], question_node_id: str = None) -> str:
@@ -722,7 +725,8 @@ class TraceGraph:
             if md.get("evidence_isolation_valid") is False:
                 errors.append(f"evidence_isolation_invalid:{node['id']}")
             claim = md
-            if claim.get("claim_type") in {"answer_claim", "factual_claim"} and not claim.get("dependencies"):
+            resolves_subgoal = bool(claim.get("resolves_subgoal_ids"))
+            if claim.get("claim_type") in {"answer_claim", "factual_claim"} and not claim.get("dependencies") and not resolves_subgoal:
                 errors.append(f"missing_expected_dependency:{node['id']}")
         for edge in self.edges:
             if edge["type"] == "next_in_branch":
