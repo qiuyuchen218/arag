@@ -19,6 +19,11 @@ class BranchState:
     inherited_evidence_ids: List[str] = field(default_factory=list)
     invalidated_node_ids: List[str] = field(default_factory=list)
     constraints: List[Dict[str, Any]] = field(default_factory=list)
+    inherited_nodes: List[str] = field(default_factory=list)
+    rejected_hypotheses: List[Dict[str, Any]] = field(default_factory=list)
+    active_unresolved_subgoals: List[str] = field(default_factory=list)
+    repair_instruction: str = ""
+    branch_budget: int = 0
     status: str = "planned"
     cost: float = 0.0
     created_at: str = field(default_factory=utc_now)
@@ -40,6 +45,11 @@ class BranchManager:
         inherited_evidence_ids: List[str] = None,
         invalidated_node_ids: List[str] = None,
         constraints: List[Dict[str, Any]] = None,
+        inherited_nodes: List[str] = None,
+        rejected_hypotheses: List[Dict[str, Any]] = None,
+        active_unresolved_subgoals: List[str] = None,
+        repair_instruction: str = "",
+        branch_budget: int = 0,
     ) -> BranchState:
         if parent_branch_id not in {b.branch_id for b in self.branches}:
             raise ValueError(f"Unknown parent branch: {parent_branch_id}")
@@ -54,6 +64,11 @@ class BranchManager:
             inherited_evidence_ids or [],
             invalidated_node_ids or [],
             constraints or [],
+            inherited_nodes or [],
+            rejected_hypotheses or [],
+            active_unresolved_subgoals or [],
+            repair_instruction,
+            branch_budget,
         )
         self.branches.append(state)
         return state
@@ -147,8 +162,164 @@ class BlameEngine:
             n["id"] for n in trace.get("nodes", [])
             if n.get("type") == "claim" and n.get("status") in {"UNSUPPORTED", "CONTRADICTED", "INVALID_PROVENANCE", "DEPENDENCY_BROKEN", "UNCERTAIN"}
         ]
+        failed_nodes += [
+            n["id"] for n in trace.get("nodes", [])
+            if n.get("type") == "coverage_assessment" and n.get("status") in {"UNTESTED", "STALLED", "EXHAUSTED"}
+        ]
+        if failure_types:
+            failed_nodes += [n["id"] for n in trace.get("nodes", []) if n.get("type") == "answer"]
         ancestor_paths = _causal_ancestor_paths(trace, failed_nodes)
         ancestor_ids = set(ancestor_paths)
+        for node in trace.get("nodes", []):
+            if node.get("type") != "epistemic_state_event" or node.get("id") not in ancestor_ids:
+                continue
+            md = node.get("metadata", {}) or {}
+            new_state = md.get("new_state")
+            if new_state not in {"COMMITTED", "USED_AS_PREMISE"}:
+                continue
+            support = float(md.get("support_score_at_event", 0.0) or 0.0)
+            missing = md.get("missing_constraint_ids", []) or []
+            unsupported = support < 0.7
+            if not unsupported and not missing:
+                continue
+            decision_id = md.get("generated_by_decision_id")
+            decision = node_by_id.get(decision_id, {})
+            if decision.get("type") != "decision_record":
+                continue
+            if not md.get("authoritative") or decision.get("metadata", {}).get("authoritative") is not True:
+                continue
+            action_role = (md.get("action_role") or decision.get("metadata", {}).get("action_role") or "").upper()
+            if action_role in {"EXPLORE", "TEST", "VERIFY", "DISAMBIGUATE"}:
+                continue
+            downstream = _affected_downstream(trace, node["id"], set(failed_nodes))
+            execution_downstream = _downstream_execution_nodes(trace, node["id"])
+            if not execution_downstream:
+                continue
+            rollback = _rollback_before(trace, node["id"])
+            rollback_valid = bool(rollback and trace_node_event_seq(trace, rollback) < trace_node_event_seq(trace, node["id"]))
+            epistemic_force = 1.0 if new_state == "USED_AS_PREMISE" else 0.8
+            constraint_gap = len(missing) / max(len(missing) + len(md.get("available_evidence_ids", []) or []), 1)
+            downstream_influence = min(1.0, len(execution_downstream) / 3)
+            action_criticality = 1.0 if action_role in {"USE_AS_PREMISE", "COMMIT"} else 0.5
+            defect = (1 - support) * epistemic_force * max(constraint_gap, 0.5 if unsupported else 0.0) * downstream_influence * action_criticality
+            candidates.append({
+                "node_id": node["id"],
+                "node_type": "epistemic_state_event",
+                "root_bad_type": "unsupported_epistemic_promotion",
+                "failure_type": "UNSUPPORTED_COMMITMENT" if new_state == "COMMITTED" else "PREMATURE_BINDING",
+                "proposition_id": md.get("proposition_id"),
+                "decision_id": decision_id,
+                "new_state": new_state,
+                "event_seq": node.get("event_seq"),
+                "blame": defect,
+                "blame_type": "estimated",
+                "dimension_breakdown": {
+                    "unsupportedness": 1 - support,
+                    "epistemic_force": epistemic_force,
+                    "constraint_gap": constraint_gap,
+                    "downstream_influence": downstream_influence,
+                    "action_criticality": action_criticality,
+                },
+                "diagnostic_confidence": 0.8 if md.get("authoritative") else 0.45,
+                "repairability": 1.0 if rollback_valid else 0.0,
+                "expected_support_gain": min(0.7, defect),
+                "repair_cost": 1,
+                "suggested_action": "reopen_proposition_before_using_as_premise",
+                "root_generator_llm": decision.get("metadata", {}).get("generated_by_llm_call_id"),
+                "rollback_checkpoint": rollback,
+                "rollback_valid": rollback_valid,
+                "affected_downstream_nodes": downstream,
+                "downstream_execution_nodes": execution_downstream,
+                "causal_path_to_failure": ancestor_paths.get(node["id"], [node["id"]]),
+                "causal_path_valid": rollback_valid and bool(execution_downstream),
+                "full_causal_path_valid": rollback_valid and bool(execution_downstream),
+                "root_to_failure_contains_execution": bool(execution_downstream),
+            })
+        for node in trace.get("nodes", []):
+            if node.get("type") != "coverage_assessment":
+                continue
+            if node.get("status") not in {"UNTESTED", "STALLED", "EXHAUSTED"}:
+                continue
+            md = node.get("metadata", {}) or {}
+            if node.get("id") not in ancestor_ids and node.get("id") not in failed_nodes:
+                continue
+            query_ids = md.get("plan_query_ids", []) or []
+            decision_ids = md.get("query_decision_ids", []) or []
+            rollback = _rollback_before(trace, node["id"])
+            rollback_valid = bool(rollback and trace_node_event_seq(trace, rollback) < trace_node_event_seq(trace, node["id"]))
+            state = node.get("status")
+            if state == "UNTESTED":
+                failure_type = "RELATION_DEPENDENCY_MISSING"
+                root_bad_type = "retrieval_coverage_untested"
+                suggested = "target_missing_required_relation"
+                confidence = 0.68
+            elif state == "STALLED":
+                failure_type = "QUERY_STRATEGY_STALLED"
+                root_bad_type = "retrieval_strategy_stalled"
+                suggested = "rewrite_query_with_new_entities_or_strategy"
+                confidence = 0.72
+            else:
+                failure_type = "RETRIEVAL_COVERAGE_FAILURE"
+                root_bad_type = "retrieval_coverage_exhausted"
+                suggested = "increase_retrieval_budget_or_switch_strategy"
+                confidence = 0.62
+            if any(f in failure_types for f in {"PREMATURE_TERMINATION", "ANSWER_MISSING", "DEPENDENCY_BROKEN"}) and state == "ACTIVE":
+                failure_type = "PREMATURE_TERMINATION"
+            path = ancestor_paths.get(node["id"], [node["id"]])
+            candidates.append({
+                "node_id": node["id"],
+                "node_type": "coverage_assessment",
+                "root_bad_type": root_bad_type,
+                "failure_type": failure_type,
+                "root_type": failure_type,
+                "subgoal_id": md.get("subgoal_id"),
+                "relation_id": md.get("relation_id"),
+                "coverage_state": state,
+                "unresolved_reason": md.get("unresolved_reason"),
+                "event_seq": node.get("event_seq"),
+                "blame": 0.45 if query_ids else 0.35,
+                "blame_type": "estimated",
+                "dimension_breakdown": {
+                    "coverage_gap": 1.0,
+                    "query_diversity": md.get("query_diversity", 0.0),
+                    "query_count": len(query_ids),
+                    "read_count": md.get("read_call_count", 0),
+                },
+                "diagnostic_confidence": confidence,
+                "repairability": 1.0 if rollback_valid else 0.5,
+                "expected_support_gain": 0.45,
+                "repair_cost": 2,
+                "suggested_action": suggested,
+                "root_generator_llm": _nearest_prior_llm(trace, node["id"]),
+                "rollback_checkpoint": rollback,
+                "rollback_valid": rollback_valid,
+                "affected_downstream_nodes": [md.get("subgoal_id")] if md.get("subgoal_id") else [],
+                "downstream_execution_nodes": decision_ids + query_ids,
+                "causal_path_to_failure": path,
+                "causal_path_valid": rollback_valid and bool(query_ids or decision_ids),
+                "full_causal_path_valid": rollback_valid and bool(query_ids or decision_ids),
+                "root_to_failure_contains_execution": bool(query_ids or decision_ids),
+                "root_role": "earliest_execution_error",
+            })
+        if not candidates:
+            return clean_json([{
+                "node_id": None,
+                "node_type": "none",
+                "root_bad_type": "observability_gap",
+                "failure_type": "OBSERVABILITY_GAP",
+                "diagnosis_state": "NO_AUTHORITATIVE_EPISTEMIC_DECISION",
+                "blame": 0.0,
+                "blame_type": "none",
+                "diagnostic_confidence": 0.0,
+                "repairability": 0.0,
+                "expected_support_gain": 0.0,
+                "repair_cost": 0,
+                "suggested_action": "collect_explicit_epistemic_context_or_coverage_events_before_root_identification",
+                "causal_path_valid": False,
+                "full_causal_path_valid": False,
+                "root_to_failure_contains_execution": False,
+            }])
+
         for hyp in hypotheses:
             missing = hyp.get("missing_constraints", []) or []
             node_id = hyp.get("commitment_event_id") or hyp.get("hypothesis_id")
@@ -287,15 +458,34 @@ def trace_node_step(trace: Dict[str, Any], node_id: str) -> int:
     return 10**9
 
 
+def trace_node_event_seq(trace: Dict[str, Any], node_id: str) -> int:
+    for node in trace.get("nodes", []):
+        if node.get("id") == node_id:
+            return int(node.get("event_seq") or trace_node_step(trace, node_id))
+    return 10**9
+
+
+def _is_valid_causal_edge(trace: Dict[str, Any], edge: Dict[str, Any]) -> bool:
+    if not edge.get("metadata", {}).get("causal"):
+        return False
+    if edge.get("metadata", {}).get("inferred"):
+        return False
+    by_id = {n["id"]: n for n in trace.get("nodes", [])}
+    src = by_id.get(edge.get("source"), {})
+    tgt = by_id.get(edge.get("target"), {})
+    if not src or not tgt:
+        return False
+    if src.get("branch_id", "b0") != tgt.get("branch_id", "b0"):
+        return False
+    return trace_node_event_seq(trace, src.get("id")) < trace_node_event_seq(trace, tgt.get("id"))
+
+
 def _causal_ancestor_paths(trace: Dict[str, Any], failed_nodes: List[str]) -> Dict[str, List[str]]:
     upstream: Dict[str, List[str]] = {}
     for edge in trace.get("edges", []):
-        et = edge.get("type")
         src, tgt = edge.get("source"), edge.get("target")
-        if et in {"depends_on", "proposed_for", "motivates", "generates", "proposes", "consumed_by", "executes", "retrieves", "reads", "returns"}:
+        if _is_valid_causal_edge(trace, edge):
             upstream.setdefault(tgt, []).append(src)
-        if et in {"depends_on"}:
-            upstream.setdefault(src, []).append(tgt)
     paths: Dict[str, List[str]] = {}
     queue = [(fid, [fid]) for fid in failed_nodes if fid]
     seen = set()
@@ -315,10 +505,10 @@ def _causal_ancestor_paths(trace: Dict[str, Any], failed_nodes: List[str]) -> Di
 def _affected_downstream(trace: Dict[str, Any], node_id: str, failed_nodes: set) -> List[str]:
     downstream: Dict[str, List[str]] = {}
     for edge in trace.get("edges", []):
+        if not _is_valid_causal_edge(trace, edge):
+            continue
         src, tgt = edge.get("source"), edge.get("target")
         downstream.setdefault(src, []).append(tgt)
-        if edge.get("type") == "depends_on":
-            downstream.setdefault(tgt, []).append(src)
     queue = [node_id]
     seen = set()
     affected = []
@@ -333,6 +523,27 @@ def _affected_downstream(trace: Dict[str, Any], node_id: str, failed_nodes: set)
     return affected
 
 
+def _downstream_execution_nodes(trace: Dict[str, Any], node_id: str) -> List[str]:
+    by_id = {n["id"]: n for n in trace.get("nodes", [])}
+    downstream: Dict[str, List[str]] = {}
+    for edge in trace.get("edges", []):
+        if not _is_valid_causal_edge(trace, edge):
+            continue
+        downstream.setdefault(edge.get("source"), []).append(edge.get("target"))
+    queue = list(downstream.get(node_id, []))
+    seen = set()
+    found = []
+    while queue:
+        cur = queue.pop(0)
+        if cur in seen:
+            continue
+        seen.add(cur)
+        if by_id.get(cur, {}).get("type") in {"decision_record", "plan_query", "retriever_call", "read_call", "llm_call", "answer"}:
+            found.append(cur)
+        queue.extend(downstream.get(cur, []))
+    return found
+
+
 def _rollback_before(trace: Dict[str, Any], node_id: str) -> Optional[str]:
     step = trace_node_step(trace, node_id)
     candidates = [
@@ -344,6 +555,17 @@ def _rollback_before(trace: Dict[str, Any], node_id: str) -> Optional[str]:
     snapshots = [n for n in candidates if n.get("type") == "context_snapshot"]
     pool = snapshots or candidates
     return max(pool, key=lambda n: trace_node_step(trace, n.get("id"))).get("id")
+
+
+def _nearest_prior_llm(trace: Dict[str, Any], node_id: str) -> Optional[str]:
+    step = trace_node_step(trace, node_id)
+    candidates = [
+        n for n in trace.get("nodes", [])
+        if n.get("type") == "llm_call" and trace_node_step(trace, n.get("id")) < step
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda n: trace_node_step(trace, n.get("id"))).get("id")
 
 
 def _rollback_for_decision(trace: Dict[str, Any], node_id: str) -> tuple[Optional[str], Optional[str], bool]:
@@ -420,14 +642,11 @@ def _root_to_failure_path(trace: Dict[str, Any], root_id: str, failed_nodes: set
     root_step = trace_node_step(trace, root_id)
     downstream: Dict[str, List[str]] = {}
     for edge in trace.get("edges", []):
-        src, tgt, et = edge.get("source"), edge.get("target"), edge.get("type")
-        if et == "motivates" and tgt == by_id.get(root_id, {}).get("metadata", {}).get("source_event_id"):
+        if not _is_valid_causal_edge(trace, edge):
             continue
-        if et in {"proposed_for", "updates", "depends_on", "generates", "executes", "returns", "retrieves", "reads", "delivered_in_context", "consumed_by", "targets_subgoal"}:
-            if trace_node_step(trace, tgt) >= root_step or tgt in failed_nodes:
-                downstream.setdefault(src, []).append(tgt)
-        if et == "depends_on":
-            downstream.setdefault(tgt, []).append(src)
+        src, tgt, et = edge.get("source"), edge.get("target"), edge.get("type")
+        if trace_node_step(trace, tgt) >= root_step or tgt in failed_nodes:
+            downstream.setdefault(src, []).append(tgt)
     queue = [(root_id, [root_id])]
     seen = set()
     while queue:

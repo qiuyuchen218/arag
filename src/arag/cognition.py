@@ -83,6 +83,7 @@ def heuristic_question_plan(question: str, question_id: str = None) -> QuestionP
         answer_type, slots = "free_text", ["answer"]
 
     variables, relations, constraints, plan_meta = _question_relations(q, question_id or q)
+    plan_meta = _validate_plan_coverage(q, variables, relations, plan_meta)
     subgoals = []
     prev_required = None
     for relation in relations:
@@ -157,6 +158,37 @@ def heuristic_question_plan(question: str, question_id: str = None) -> QuestionP
         validation_warnings=list(plan_meta.get("validation_warnings", [])),
         prompt_hash=stable_hash(q, answer_type, slots),
     )
+
+
+def _validate_plan_coverage(question: str, variables: List[Dict[str, Any]], relations: List[Dict[str, Any]], meta: Dict[str, Any]) -> Dict[str, Any]:
+    meta = dict(meta or {})
+    warnings = list(meta.get("validation_warnings", []))
+    lower = (question or "").lower()
+    relation_cues = [
+        "whose", "'s", "mother", "father", "birthplace", "located", "based", "created",
+        "founded", "established", "abolished", "immediately", "north", "south", "east", "west",
+        "battle", "where", "when", "who",
+    ]
+    cue_count = sum(1 for cue in relation_cues if cue in lower)
+    fallback = any(r.get("relation_type") == "FALLBACK_PLACEHOLDER" for r in relations)
+    if fallback and cue_count >= 2:
+        warnings.append("PLAN_UNDERDECOMPOSED")
+        meta["semantic_valid"] = False
+        meta["planner_confidence"] = min(float(meta.get("planner_confidence", 0.2) or 0.2), 0.35)
+    if len(relations) <= 1 and any(term in lower for term in [" and ", " whose ", " that ", " immediately ", " located in ", " location of "]):
+        warnings.append("PLAN_UNDERDECOMPOSED")
+        meta["semantic_valid"] = False
+    given_entities = [v for v in variables if v.get("role") == "given_entity" and v.get("value")]
+    if not given_entities and re.search(r"\b[A-Z][A-Za-z0-9_-]+(?:\s+[A-Z][A-Za-z0-9_-]+)+\b", question or ""):
+        warnings.append("PLAN_UNMAPPED_CONSTRAINT")
+    answer_rel = next((r for r in relations if r.get("answer_constraint")), relations[-1] if relations else None)
+    if answer_rel and relations and len(relations) > 1:
+        deps = set(answer_rel.get("dependencies") or [])
+        if not deps and answer_rel is not relations[0]:
+            warnings.append("PLAN_AMBIGUOUS")
+            meta["semantic_valid"] = False
+    meta["validation_warnings"] = list(dict.fromkeys(warnings))
+    return meta
 
 
 def _question_relations(question: str, seed: str) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[str], Dict[str, Any]]:
@@ -768,16 +800,16 @@ def _candidate_constraint_results(entity: str, question_plan: QuestionPlan, evid
     results = {}
     evidence_ids = list(evidence_ids or [])
     for cid in question_plan.constraints:
-        status = "SATISFIED" if evidence_ids else "UNKNOWN"
+        status = "UNKNOWN"
         results[cid] = {
             "constraint_id": cid,
             "status": status,
-            "support_score": 0.5 if evidence_ids else 0.0,
+            "support_score": 0.0,
             "supporting_claim_ids": [],
-            "supporting_evidence_ids": evidence_ids[:3],
+            "supporting_evidence_ids": [],
             "contradiction_evidence_ids": [],
             "verifier_mode": "heuristic_observable",
-            "reason": "candidate has provenance-visible evidence" if evidence_ids else "no relation-specific evidence selected",
+            "reason": "candidate mention alone is not relation-specific evidence",
         }
     return results
 
@@ -830,12 +862,18 @@ DATE_RE = re.compile(
 def classify_claim(content: str) -> tuple[str, float]:
     text = (content or "").strip()
     lower = text.lower()
-    if not text or re.fullmatch(r"\d+[\.)]?", text):
-        return "meta_claim", 0.0
+    fragment_markers = {
+        "given that", "given that:", "based on my searches", "based on my searches:",
+        "however", "however:", "therefore", "therefore:", "so", "so:",
+    }
+    if not text or re.fullmatch(r"\d+[\.)]?", text) or lower in fragment_markers or re.fullmatch(r"(?:given that|however|therefore|based on my searches)\s*:\s*\d*[\.)]?", lower):
+        return "incomplete_fragment", 0.0
     if any(p in lower for p in ["i searched", "i found", "let me", "i have not found", "cannot find", "search results show"]):
         if DATE_RE.search(text):
             return "abstention_claim", 0.2
         return "process_claim", 0.0
+    if any(p in lower for p in ["no results", "did not return", "corpus does not contain", "provided documents do not contain"]):
+        return "retrieval_coverage_claim", 0.3
     if any(p in lower for p in ["cannot be answered", "not available", "no information", "not present in the provided"]):
         return "abstention_claim", 0.4
     if DATE_RE.search(text):
@@ -1119,7 +1157,7 @@ def assess_answer(
 def _text_matches_relation(text: str, rel: Dict[str, Any], known_entities: Dict[str, str]) -> bool:
     lower = (text or "").lower()
     predicate_terms = [t for t in re.split(r"[_\s]+", str(rel.get("predicate", "")).lower()) if t and t not in {"date", "answer"}]
-    predicate_match = any(t in lower for t in predicate_terms) or (rel.get("expected_output_type") == "temporal" and DATE_RE.search(text or ""))
+    predicate_match = any(t in lower for t in predicate_terms)
     binding_values = [v.lower() for v in known_entities.values()]
     binding_match = not binding_values or any(v in lower for v in binding_values)
     return bool(predicate_match and binding_match)
@@ -1141,7 +1179,25 @@ def _relation_subject_label(question_plan: QuestionPlan, rel: Dict[str, Any], te
 def _proposition_grounds_relation(question_plan: QuestionPlan, rel: Dict[str, Any], prop: Dict[str, Any]) -> bool:
     if prop.get("predicate") != rel.get("predicate"):
         return False
+    if prop.get("source_type") == "final_answer":
+        return False
+    text = " ".join(str(prop.get(k) or "") for k in ["subject", "predicate", "object", "value"]).lower()
+    if any(marker in text for marker in ["not ", "no evidence", "cannot confirm", "unclear", "might", "may be", "for example", "hypothetical"]):
+        return False
+    has_provenance = bool(prop.get("evidence_span_ids") or prop.get("claim_ids"))
+    if not has_provenance:
+        return False
+    bindings = _known_bindings_from_variables(question_plan.variables)
+    subject_var = str(rel.get("subject_variable") or "")
+    expected_subject = bindings.get(subject_var)
+    if expected_subject and expected_subject.lower() not in str(prop.get("subject") or "").lower():
+        return False
     if rel.get("expected_output_type") == "temporal" and not prop.get("value"):
+        return False
+    if rel.get("expected_output_type") == "temporal" and prop.get("value") and not DATE_RE.search(str(prop.get("value"))):
+        return False
+    object_var = str(rel.get("object_variable") or "")
+    if object_var and not prop.get("object"):
         return False
     return True
 
@@ -1196,6 +1252,18 @@ def build_shadow_repair_plan(
     claim_assessments: List[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     root = blame_results[0] if blame_results else {}
+    execution_roots = [
+        b for b in blame_results or []
+        if b.get("node_type") in {"epistemic_state_event", "coverage_assessment", "decision_record", "plan_query", "retriever_call", "read_call"}
+        and b.get("node_id")
+    ]
+    primary_root = root if root.get("node_id") else (execution_roots[0] if execution_roots else {})
+    earliest_execution_error = min(
+        execution_roots,
+        key=lambda b: b.get("event_seq", b.get("step_index", 10**9)) if b.get("event_seq") is not None else 10**9,
+        default={},
+    )
+    proximate_error = execution_roots[-1] if execution_roots else {}
     required_constraints = question_plan.get("constraints", [])
     failed_subgoal = (unresolved_subgoals or root_bad_hypotheses or [None])[0]
     matrix = candidate_matrix or {
@@ -1203,13 +1271,29 @@ def build_shadow_repair_plan(
         "commitment_gate": "all_required_constraints_satisfied",
         "required_constraint_ids": required_constraints,
     }
-    root_is_decision = root.get("node_type") in {"commitment_event", "query_intent", "plan_query", "hypothesis"}
+    root_is_decision = root.get("node_type") in {"epistemic_state_event", "decision_record", "commitment_event", "query_intent", "plan_query", "hypothesis"}
     root_temporally_repairable = bool(root.get("root_generator_llm")) and bool(root.get("rollback_valid"))
+    causal_path_valid = bool(root.get("full_causal_path_valid", root.get("causal_path_valid", False)))
+    root_to_failure_contains_execution = bool(root.get("root_to_failure_contains_execution", False))
+    blocking_reasons = []
+    if not root:
+        blocking_reasons.append("NO_CAUSAL_ROOT")
+    if root and root.get("diagnosis_state") == "NO_AUTHORITATIVE_EPISTEMIC_DECISION":
+        blocking_reasons.append("NO_AUTHORITATIVE_EPISTEMIC_DECISION")
+    if root and not causal_path_valid:
+        blocking_reasons.append("NO_EXECUTION_PATH_TO_FAILURE")
+    if root and not root_to_failure_contains_execution:
+        blocking_reasons.append("ROOT_TO_FAILURE_MISSING_EXECUTION")
+    if root and not root_temporally_repairable:
+        blocking_reasons.append("NO_VALID_ROLLBACK_CHECKPOINT")
+    if any(f in failure_types for f in {"PLAN_UNDERDECOMPOSED", "PLAN_AMBIGUOUS", "PLAN_UNMAPPED_CONSTRAINT", "PLAN_UNCERTAIN"}):
+        blocking_reasons.append("PLANNER_UNCERTAINTY")
     diagnostic_status = (
         "REPAIRABLE_ROOT_FOUND"
-        if root_is_decision and root_temporally_repairable and root.get("causal_path_valid", bool(root.get("causal_path_to_failure")))
+        if root_is_decision and root_temporally_repairable and causal_path_valid and root_to_failure_contains_execution and "PLANNER_UNCERTAINTY" not in blocking_reasons
         else "INSUFFICIENT_DIAGNOSTIC_EVIDENCE"
     )
+    root_confirmed = diagnostic_status == "REPAIRABLE_ROOT_FOUND"
     inherited = []
     evsets = []
     for assessment in claim_assessments or []:
@@ -1240,15 +1324,45 @@ def build_shadow_repair_plan(
         "repair_plan_id": f"repair_{stable_hash(failure_types, root_bad_hypotheses, unresolved_subgoals)}",
         "mode": "shadow_dry_run",
         "diagnostic_status": diagnostic_status,
+        "diagnosis_reason": blocking_reasons[0] if blocking_reasons else "CAUSAL_ROOT_CANDIDATE_AVAILABLE",
+        "root_selection_status": "CANDIDATE_ROOT_UNCONFIRMED" if root and not root_confirmed else ("CONFIRMED_CAUSAL_ROOT" if root_confirmed else "NO_CAUSAL_ROOT"),
+        "diagnosis_blocking_reasons": blocking_reasons,
         "diagnostic_confidence": root.get("diagnostic_confidence", 0.0),
         "created_at": utc_now(),
         "failed_claim_or_subgoal": failed_subgoal,
         "failed_subgoal": failed_subgoal,
-        "root_cause_node": root.get("node_id"),
+        "root_cause_node": root.get("node_id") if root_confirmed else None,
+        "candidate_root_node": root.get("node_id"),
+        "primary_root": {
+            "node_id": primary_root.get("node_id"),
+            "root_type": primary_root.get("root_type") or primary_root.get("failure_type"),
+            "status": "confirmed" if root_confirmed and primary_root.get("node_id") == root.get("node_id") else "candidate",
+            "confidence": primary_root.get("diagnostic_confidence", 0.0),
+        },
+        "earliest_execution_error": {
+            "node_id": earliest_execution_error.get("node_id"),
+            "root_type": earliest_execution_error.get("root_type") or earliest_execution_error.get("failure_type"),
+            "confidence": earliest_execution_error.get("diagnostic_confidence", 0.0),
+        },
+        "proximate_error": {
+            "node_id": proximate_error.get("node_id"),
+            "root_type": proximate_error.get("root_type") or proximate_error.get("failure_type"),
+            "confidence": proximate_error.get("diagnostic_confidence", 0.0),
+        },
+        "enabling_conditions": [
+            {
+                "node_id": b.get("node_id"),
+                "root_type": b.get("root_type") or b.get("failure_type"),
+                "confidence": b.get("diagnostic_confidence", 0.0),
+            }
+            for b in (blame_results or [])[1:4]
+        ],
         "root_generator_llm": root.get("root_generator_llm"),
         "alternative_root_candidates": blame_results[1:4],
         "causal_path_to_failure": root.get("causal_path_to_failure", []),
-        "rollback_checkpoint": root.get("rollback_checkpoint") or root.get("node_id"),
+        "rollback_checkpoint": (root.get("rollback_checkpoint") or root.get("node_id")) if root_confirmed else root.get("rollback_checkpoint"),
+        "counterfactual_tested": False,
+        "root_confirmation": "INCONCLUSIVE",
         "failure_types": failure_types,
         "verified_inherited_claims": inherited,
         "inherited_minimal_evidence_sets": evsets,

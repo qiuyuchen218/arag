@@ -3,10 +3,11 @@
 import os
 import pickle
 import threading
+import hashlib
 import numpy as np
 from typing import Dict, List, Any, Tuple, TYPE_CHECKING
 
-from arag.core.schemas import EvidenceSpan, SearchHit, ToolResult, artifact_id, result_dict, stable_hash
+from arag.core.schemas import EvidenceSpan, SearchHit, ToolResult, artifact_id, content_fingerprint, result_dict, stable_hash
 from arag.tools.base import BaseTool
 
 if TYPE_CHECKING:
@@ -50,8 +51,20 @@ class SemanticSearchTool(BaseTool):
 
         self.embedding_model = SentenceTransformer(model_name, device=self.device)
         self._load_index()
-        self.corpus_version = stable_hash(chunks_file, len(self.chunks))
-        self.index_version = stable_hash(index_dir, len(self.sentences), getattr(self.embeddings, "shape", None))
+        self.corpus_version = content_fingerprint({
+            "chunks_file": chunks_file,
+            "chunks": self.chunks,
+        })
+        self.index_version = content_fingerprint({
+            "index_dir": index_dir,
+            "model_name": model_name,
+            "corpus_version": self.corpus_version,
+            "sentences": self.sentences,
+            "sentence_to_chunk": self.sentence_to_chunk,
+            "embeddings_shape": getattr(self.embeddings, "shape", None),
+            "embeddings_dtype": str(getattr(self.embeddings, "dtype", "")),
+            "embeddings_hash": hashlib.sha256(getattr(self.embeddings, "tobytes", lambda: b"")()).hexdigest(),
+        })
         self.tokenizer = tiktoken.encoding_for_model("gpt-4o")
 
     @property
@@ -109,9 +122,43 @@ RETURNS: Abbreviated snippets with matched sentences. Use read_chunk to get full
                             "type": "integer",
                             "description": "Number of most relevant results to return (default: 5, max: 20)",
                             "default": 5
+                        },
+                        "epistemic_context": {
+                            "type": "object",
+                            "description": "Required public decision context. Include at least one proposition that this retrieval is exploring, testing, verifying, committing, or using as a premise.",
+                            "properties": {
+                                "action_role": {
+                                    "type": "string",
+                                    "enum": ["EXPLORE", "TEST", "VERIFY", "DISAMBIGUATE", "USE_AS_PREMISE", "COMMIT"]
+                                },
+                                "active_subgoal_ids": {"type": "array", "items": {"type": "string"}},
+                                "purpose": {"type": "string"},
+                                "propositions": {
+                                    "type": "array",
+                                    "minItems": 1,
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "subject": {"type": "string"},
+                                            "predicate": {"type": "string"},
+                                            "object": {"type": "string"},
+                                            "relation_id": {"type": "string"},
+                                            "stance": {
+                                                "type": "string",
+                                                "enum": ["HYPOTHESIS", "PARTIALLY_SUPPORTED", "COMMITTED"]
+                                            },
+                                            "supporting_evidence_ids": {"type": "array", "items": {"type": "string"}},
+                                            "missing_constraint_ids": {"type": "array", "items": {"type": "string"}}
+                                        },
+                                        "required": ["subject", "predicate", "object", "stance"]
+                                    }
+                                }
+                            },
+                            "required": ["action_role", "active_subgoal_ids", "purpose", "propositions"],
+                            "additionalProperties": True
                         }
                     },
-                    "required": ["query"]
+                    "required": ["query", "epistemic_context"]
                 }
             }
         }

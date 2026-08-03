@@ -99,6 +99,35 @@ def test_failure_frontier_and_estimated_blame():
     assert blame[0]["suggested_action"] == "rewrite_query"
 
 
+def test_failure_frontier_maps_subgoal_dependencies_to_resolving_claims():
+    assessments = [
+        {
+            "claim": {"claim_id": "parent", "dependencies": [], "resolves_subgoal_ids": ["sg_parent"]},
+            "status": "UNSUPPORTED",
+            "authoritative": True,
+        },
+        {
+            "claim": {"claim_id": "child", "dependencies": ["sg_parent"], "resolves_subgoal_ids": ["sg_child"]},
+            "status": "DEPENDENCY_BLOCKED",
+            "authoritative": True,
+        },
+    ]
+    assert failure_frontier(assessments) == ["parent"]
+
+
+def test_corpus_version_changes_when_chunk_content_changes(tmp_path):
+    chunks = tmp_path / "chunks.json"
+    write_chunks(chunks)
+    first = KeywordSearchTool(str(chunks)).corpus_version
+    chunks.write_text(json.dumps([
+        {"id": "1", "doc_id": "a", "text": "Changed content with same chunk count."},
+        {"id": "2", "doc_id": "a", "text": "Alpha beta gamma repeated nearby."},
+        {"id": "3", "doc_id": "b", "text": "Delta evidence contradicts nothing."},
+    ]), encoding="utf-8")
+    second = KeywordSearchTool(str(chunks)).corpus_version
+    assert first != second
+
+
 def test_cognitive_blame_requires_causal_ancestor_and_has_downstream():
     trace = {
         "nodes": [
@@ -110,13 +139,10 @@ def test_cognitive_blame_requires_causal_ancestor_and_has_downstream():
             {"id": "subgoal_x", "type": "subgoal", "step_index": None},
         ],
         "edges": [
-            {"source": "ctx_001", "target": "llm_001", "type": "consumed_by"},
-            {"source": "llm_001", "target": "pq_004", "type": "invokes"},
-            {"source": "pq_004", "target": "hyp_k", "type": "proposes"},
-            {"source": "hyp_k", "target": "commit_k", "type": "generates"},
-            {"source": "commit_k", "target": "pq_004", "type": "motivates"},
-            {"source": "hyp_k", "target": "subgoal_x", "type": "proposed_for"},
-            {"source": "commit_k", "target": "subgoal_x", "type": "proposed_for"},
+            {"source": "ctx_001", "target": "llm_001", "type": "consumed_by", "metadata": {"causal": True}},
+            {"source": "llm_001", "target": "pq_004", "type": "emits", "metadata": {"causal": True}},
+            {"source": "pq_004", "target": "commit_k", "type": "emits", "metadata": {"causal": True}},
+            {"source": "commit_k", "target": "subgoal_x", "type": "motivates", "metadata": {"causal": True}},
         ],
     }
     hypotheses = [{
@@ -129,8 +155,8 @@ def test_cognitive_blame_requires_causal_ancestor_and_has_downstream():
     unresolved = [{"subgoal_id": "subgoal_x", "required": True}]
     blame = BlameEngine().score_cognitive(["PREMATURE_ENTITY_COMMITMENT"], unresolved, hypotheses, trace)
     assert blame
-    assert blame[0]["affected_downstream_nodes"]
-    assert blame[0]["rollback_checkpoint"] == "ctx_001"
+    assert blame[0]["failure_type"] == "OBSERVABILITY_GAP"
+    assert blame[0]["diagnosis_state"] == "NO_AUTHORITATIVE_EPISTEMIC_DECISION"
 
 
 def test_branch_fork_and_rejected_hypothesis():

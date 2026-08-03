@@ -4,7 +4,7 @@ import json
 import re
 from typing import Any, Dict, List, Tuple, TYPE_CHECKING
 
-from arag.core.schemas import EvidenceSpan, ReadReceipt, ToolResult, artifact_id, content_hash, result_dict, stable_hash
+from arag.core.schemas import EvidenceSpan, ReadReceipt, ToolResult, artifact_id, content_fingerprint, content_hash, result_dict, stable_hash
 from arag.tools.base import BaseTool
 
 if TYPE_CHECKING:
@@ -23,7 +23,10 @@ class ReadChunkTool(BaseTool):
     def __init__(self, chunks_file: str):
         self.chunks_file = chunks_file
         self.chunks = self._load_chunks()
-        self.corpus_version = stable_hash(chunks_file, len(self.chunks))
+        self.corpus_version = content_fingerprint({
+            "chunks_file": chunks_file,
+            "chunks": self.chunks,
+        })
         self.chunks_dict = {str(c['id']): c for c in self.chunks}
 
         if not HAS_TIKTOKEN:
@@ -116,9 +119,43 @@ Note: Previously read chunks will be marked as already seen to avoid redundant i
                         "window_before": {"type": "integer", "default": 0},
                         "window_after": {"type": "integer", "default": 0},
                         "max_tokens": {"type": "integer", "default": 0},
-                        "return_cached": {"type": "boolean", "default": True}
+                        "return_cached": {"type": "boolean", "default": True},
+                        "epistemic_context": {
+                            "type": "object",
+                            "description": "Required public decision context. Include at least one proposition that this read is exploring, testing, verifying, committing, or using as a premise.",
+                            "properties": {
+                                "action_role": {
+                                    "type": "string",
+                                    "enum": ["EXPLORE", "TEST", "VERIFY", "DISAMBIGUATE", "USE_AS_PREMISE", "COMMIT"]
+                                },
+                                "active_subgoal_ids": {"type": "array", "items": {"type": "string"}},
+                                "purpose": {"type": "string"},
+                                "propositions": {
+                                    "type": "array",
+                                    "minItems": 1,
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "subject": {"type": "string"},
+                                            "predicate": {"type": "string"},
+                                            "object": {"type": "string"},
+                                            "relation_id": {"type": "string"},
+                                            "stance": {
+                                                "type": "string",
+                                                "enum": ["HYPOTHESIS", "PARTIALLY_SUPPORTED", "COMMITTED"]
+                                            },
+                                            "supporting_evidence_ids": {"type": "array", "items": {"type": "string"}},
+                                            "missing_constraint_ids": {"type": "array", "items": {"type": "string"}}
+                                        },
+                                        "required": ["subject", "predicate", "object", "stance"]
+                                    }
+                                }
+                            },
+                            "required": ["action_role", "active_subgoal_ids", "purpose", "propositions"],
+                            "additionalProperties": True
+                        }
                     },
-                    "required": ["chunk_ids"]
+                    "required": ["chunk_ids", "epistemic_context"]
                 }
             }
         }

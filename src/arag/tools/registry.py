@@ -32,6 +32,7 @@ class ToolRegistry:
         tool = self._tools.get(name)
         if not tool:
             return f"Error: Tool '{name}' not found", {"error": "tool_not_found"}
+        epistemic_context = kwargs.pop("epistemic_context", None)
         
         try:
             result = tool.execute(context, **kwargs)
@@ -40,6 +41,8 @@ class ToolRegistry:
             if isinstance(result, tuple) and len(result) == 2:
                 rendered, log = result
                 log = dict(log or {})
+                if epistemic_context is not None:
+                    log["epistemic_context"] = epistemic_context
                 log.setdefault("tool_result", ToolResult(
                     call_id=f"call_{stable_hash(name, kwargs, utc_now())}",
                     tool_name=name,

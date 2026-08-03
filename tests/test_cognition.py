@@ -135,5 +135,6 @@ def test_candidate_constraint_matrix_contains_all_candidates():
     matrix = build_candidate_constraint_matrix(plan, tracker.hypothesis_dicts())
     assert {c["candidate_entity"] for c in matrix["candidates"]} == {"Region_A", "Region_B"}
     by_entity = {c["candidate_entity"]: c for c in matrix["candidates"]}
-    assert by_entity["Region_A"]["identity_coverage"] > by_entity["Region_B"]["identity_coverage"]
+    assert by_entity["Region_A"]["identity_coverage"] == by_entity["Region_B"]["identity_coverage"] == 0.0
+    assert all(cr["status"] == "UNKNOWN" for cr in by_entity["Region_A"]["constraint_results"].values())
     assert by_entity["Region_B"]["unknown_count"] > 0

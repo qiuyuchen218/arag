@@ -9,7 +9,7 @@ def _assert_valid(trace: TraceGraph):
     graph = trace.to_dict()
     trace.validate()
     node_ids = {node["id"] for node in graph["nodes"]}
-    assert graph["trace_schema_version"] == "2.0"
+    assert graph["trace_schema_version"] == "2.1"
     assert all({"id", "type", "content", "metadata", "timestamp", "status"} <= set(n)
                for n in graph["nodes"])
     assert all({"source", "target", "type", "metadata"} <= set(e) for e in graph["edges"])

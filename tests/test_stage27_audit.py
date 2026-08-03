@@ -56,7 +56,7 @@ def test_candidate_matrix_has_unknown_without_evidence_and_supported_with_eviden
     tracker.observe_query(parse_query_intent(plan, "Region_B history"))
     matrix = build_candidate_constraint_matrix(plan, tracker.hypothesis_dicts())
     by_entity = {c["candidate_entity"]: c for c in matrix["candidates"]}
-    assert any(cr["status"] == "SATISFIED" for cr in by_entity["Region_A"]["constraint_results"].values())
+    assert all(cr["status"] == "UNKNOWN" for cr in by_entity["Region_A"]["constraint_results"].values())
     assert any(cr["status"] == "UNKNOWN" for cr in by_entity["Region_B"]["constraint_results"].values())
 
 

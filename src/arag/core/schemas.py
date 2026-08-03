@@ -40,6 +40,11 @@ def stable_hash(*parts: Any, length: int = 16) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:length]
 
 
+def content_fingerprint(value: Any, length: int = 16) -> str:
+    payload = json.dumps(clean_json(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:length]
+
+
 def content_hash(text: str) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
 

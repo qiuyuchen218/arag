@@ -51,8 +51,13 @@ class SimpleClaimExtractor:
 
     def extract(self, text: str, generated_by: str = None, branch_id: str = "b0") -> List[Claim]:
         claims = []
-        for idx, sentence in enumerate(re.split(r"(?<=[.!?。！？])\s+", text or "")):
+        normalized = re.sub(r"\n\s*(\d+[\.)]|[-*])\s*", ". ", text or "")
+        normalized = re.sub(r":\s*(\d+[\.)])", ": ", normalized)
+        parts = re.split(r"(?<=[.!?。！？])\s+|\n+", normalized)
+        for idx, sentence in enumerate(parts):
             content = re.sub(r"^\s*(?:[-*]|\d+[\.)])\s*", "", sentence.strip())
+            content = re.sub(r"\s+", " ", content).strip()
+            content = re.sub(r":\.$", ":", content)
             if not content:
                 continue
             claim_type, criticality = classify_claim(content)
@@ -68,7 +73,7 @@ class SimpleClaimExtractor:
         answer_claims = [c for c in claims if c.claim_type == "answer_claim"]
         if not answer_claims and claims:
             for claim in reversed(claims):
-                if claim.criticality > 0 and claim.claim_type not in {"process_claim", "meta_claim"}:
+                if claim.criticality > 0 and claim.claim_type not in {"process_claim", "meta_claim", "incomplete_fragment", "retrieval_coverage_claim"}:
                     claim.claim_type = "answer_claim"
                     claim.criticality = max(claim.criticality, 0.8)
                     break
@@ -268,11 +273,12 @@ class ClaimSupportScorer:
         dependency_ids: List[str] = None,
         blocked_dependency_ids: List[str] = None,
         plan_semantic_valid: bool = True,
+        verification_result: VerificationResult = None,
     ) -> Dict[str, Any]:
         legal = [s for s in spans if s.span_id in set(delivered_span_ids or [])]
         selected_spans = _select_evidence_set(claim, legal, max_spans=3)
         g_prov = 1.0 if selected_spans else 0.0
-        verification = self.backend.verify(claim, selected_spans)
+        verification = verification_result or self.backend.verify(claim, selected_spans)
         e = max(0.0, min(1.0, verification.evidence_entailment if verification.evidence_entailment is not None else verification.p_entail))
         c = max(0.0, min(1.0, verification.evidence_contradiction if verification.evidence_contradiction is not None else verification.p_contradict))
         p = g_prov
@@ -390,7 +396,7 @@ class ClaimSupportScorer:
             "verifier_decision_capable": verification.authoritative,
             "verifier_calibrated": verification.calibrated,
             "verifier_authoritative_for_repair": verification.authoritative and not verification.calibrated,
-            "repair_eligible": verification.authoritative and status in {"UNSUPPORTED", "CONTRADICTED", "INVALID_PROVENANCE", "DEPENDENCY_BROKEN", "UNCERTAIN"},
+            "repair_eligible": verification.authoritative and status in {"UNSUPPORTED", "CONTRADICTED", "INVALID_PROVENANCE", "DEPENDENCY_BLOCKED", "DEPENDENCY_BROKEN", "UNCERTAIN"},
             "diagnostic_status": diagnostic_status,
             "evidence_status": evidence_status,
             "reasoning_status": reasoning_status,
@@ -468,14 +474,30 @@ def _rough_tokens(text: str) -> int:
 def failure_frontier(assessments: List[Dict[str, Any]]) -> List[str]:
     failed = {
         a["claim"]["claim_id"] for a in assessments
-        if a.get("authoritative") and a.get("status") in {
-            "UNSUPPORTED", "CONTRADICTED", "INVALID_PROVENANCE", "DEPENDENCY_BROKEN", "UNCERTAIN"
+        if a.get("authoritative")
+        and a.get("claim", {}).get("criticality", 1.0) > 0
+        and a.get("claim", {}).get("claim_type") not in {"process_claim", "meta_claim", "incomplete_fragment", "retrieval_coverage_claim"}
+        and a.get("status") in {
+            "UNSUPPORTED", "CONTRADICTED", "INVALID_PROVENANCE", "DEPENDENCY_BLOCKED", "DEPENDENCY_BROKEN", "UNCERTAIN"
         }
     }
     by_id = {a["claim"]["claim_id"]: a["claim"] for a in assessments}
+    resolving_claims_by_subgoal: Dict[str, List[str]] = {}
+    for assessment in assessments:
+        claim = assessment.get("claim", {})
+        claim_id = claim.get("claim_id")
+        if not claim_id:
+            continue
+        for subgoal_id in claim.get("resolves_subgoal_ids", []) or []:
+            resolving_claims_by_subgoal.setdefault(subgoal_id, []).append(claim_id)
     roots = []
     for cid in sorted(failed):
-        parents = set(by_id.get(cid, {}).get("dependencies", []))
+        parents = set()
+        for dep in by_id.get(cid, {}).get("dependencies", []) or []:
+            if dep in by_id:
+                parents.add(dep)
+            parents.update(resolving_claims_by_subgoal.get(dep, []))
+        parents.discard(cid)
         if not parents.intersection(failed):
             roots.append(cid)
     return roots

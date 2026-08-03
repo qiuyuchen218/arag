@@ -44,6 +44,7 @@ from arag.verification import (
     LLMVerificationBackend,
     SimpleClaimExtractor,
     SupportConfig,
+    VerificationResult,
     failure_frontier,
 )
 from arag.repair import BlameEngine, BranchManager, rejected_hypothesis
@@ -127,6 +128,26 @@ def _relation_dependency_subgoals(question_plan, relation_ids: List[str]) -> Lis
     return list(dict.fromkeys(deps))
 
 
+def _subgoal_supports(subgoal_assessments: List[Dict[str, Any]], cfg: SupportConfig) -> Dict[str, float]:
+    supports = {}
+    for subgoal in subgoal_assessments or []:
+        status = str(subgoal.get("status", "")).upper()
+        if status in {"RESOLVED", "SATISFIED"}:
+            support = 1.0
+        elif status in {"PARTIALLY_RESOLVED", "PARTIALLY_GROUNDED"}:
+            support = max(0.0, min(cfg.dependency_threshold - 0.01, 0.5))
+        else:
+            support = 0.0
+        supports[subgoal.get("subgoal_id")] = support
+    return {k: v for k, v in supports.items() if k}
+
+
+def _verification_result_from_assessment(assessment: Dict[str, Any]) -> VerificationResult:
+    data = ((assessment.get("best_evidence_set") or {}).get("verifier_result") or {})
+    fields = VerificationResult.__dataclass_fields__
+    return VerificationResult(**{key: data[key] for key in fields if key in data})
+
+
 def _resolve_subgoals(question_plan, assessments: List[Dict[str, Any]], answer_assessment: Dict[str, Any], relation_groundings: List[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     grounded_by_subgoal: Dict[str, List[Dict[str, Any]]] = {}
     for grounding in relation_groundings or []:
@@ -150,11 +171,16 @@ def _resolve_subgoals(question_plan, assessments: List[Dict[str, Any]], answer_a
         deps_resolved = all(status_by_id.get(dep) == "RESOLVED" for dep in deps)
         resolver_ids = verified_by_resolution.get(data["subgoal_id"], [])
         groundings = grounded_by_subgoal.get(data["subgoal_id"], [])
-        grounded = any(g.get("status") == "SATISFIED" for g in groundings)
+        grounded = any(
+            g.get("status") == "SATISFIED"
+            and g.get("supporting_evidence_ids")
+            and (g.get("confidence", 0) or 0) >= 0.7
+            for g in groundings
+        )
         partial = any(g.get("status") in {"PARTIALLY_GROUNDED", "SATISFIED"} for g in groundings)
         if deps and not deps_resolved:
             data["status"] = "BLOCKED"
-        elif grounded or resolver_ids:
+        elif grounded:
             data["status"] = "RESOLVED"
             data["resolved_by_claim_ids"] = resolver_ids
             data["satisfied_constraints"] = list(dict.fromkeys((data.get("satisfied_constraints") or []) + data.get("required_constraints", [])))
@@ -187,6 +213,108 @@ def _blame_hypotheses_from_commitments(
         hyp["source_event_id"] = event.get("commitment_event_id")
         hyp["step_index"] = event.get("step_index")
     return list(by_id.values())
+
+
+def _relation_for_subgoal(question_plan, subgoal_id: str) -> Dict[str, Any]:
+    for rel in question_plan.relations:
+        data = rel if isinstance(rel, dict) else rel.__dict__
+        if data.get("subgoal_id") == subgoal_id:
+            return data
+    return {}
+
+
+def _annotate_retrieval_coverage(
+    trace_logger: TraceGraph,
+    question_plan,
+    subgoal_assessments: List[Dict[str, Any]],
+    relation_groundings: List[Dict[str, Any]],
+    termination_reason: str = "",
+) -> List[Dict[str, Any]]:
+    if not trace_logger:
+        return []
+    plan_queries = [n for n in trace_logger.nodes if n.get("type") == "plan_query"]
+    decisions = [n for n in trace_logger.nodes if n.get("type") == "decision_record"]
+    read_nodes = [n for n in trace_logger.nodes if n.get("type") == "read_call"]
+    delivered_spans = [
+        n.get("id") for n in trace_logger.nodes
+        if n.get("type") == "evidence_span"
+    ]
+    grounding_by_subgoal: Dict[str, List[Dict[str, Any]]] = {}
+    for grounding in relation_groundings or []:
+        grounding_by_subgoal.setdefault(grounding.get("subgoal_id"), []).append(grounding)
+    assessments = []
+    for sg in subgoal_assessments or []:
+        if not sg.get("required") or str(sg.get("status", "")).upper() == "RESOLVED":
+            continue
+        sg_id = sg.get("subgoal_id")
+        rel = _relation_for_subgoal(question_plan, sg_id)
+        relation_id = rel.get("relation_id")
+        predicate = rel.get("predicate") or sg.get("expected_output_type") or "required_relation"
+        related_query_ids = []
+        related_decision_ids = []
+        predicate_terms = [t for t in re.split(r"[_\\s]+", str(predicate).lower()) if t and t not in {"date", "answer"}]
+        for node in plan_queries:
+            content = str(node.get("content", "")).lower()
+            md = node.get("metadata", {}) or {}
+            args = json.dumps(md.get("arguments", {}), ensure_ascii=False).lower()
+            hit = any(t in content or t in args for t in predicate_terms) if predicate_terms else False
+            if not hit and relation_id:
+                hit = relation_id in json.dumps(md, ensure_ascii=False)
+            if hit or not predicate_terms:
+                related_query_ids.append(node.get("id"))
+                dec = next((e.get("source") for e in trace_logger.edges if e.get("target") == node.get("id") and e.get("type") == "motivates"), None)
+                if dec:
+                    related_decision_ids.append(dec)
+        strategies = list(dict.fromkeys(
+            (n.get("metadata", {}) or {}).get("tool_name")
+            for n in plan_queries
+            if n.get("id") in related_query_ids and (n.get("metadata", {}) or {}).get("tool_name")
+        ))
+        queries = [str(n.get("content", "")).strip().lower() for n in plan_queries if n.get("id") in related_query_ids]
+        query_diversity = len(set(queries)) / max(len(queries), 1)
+        satisfied = any(g.get("status") == "SATISFIED" and g.get("supporting_evidence_ids") for g in grounding_by_subgoal.get(sg_id, []))
+        if satisfied:
+            state = "SATISFIED"
+            reason = "relation_specific_evidence_grounded"
+        elif not related_query_ids:
+            state = "UNTESTED"
+            reason = "required_relation_was_never_targeted"
+        elif len(related_query_ids) >= 2 and query_diversity < 0.5:
+            state = "STALLED"
+            reason = "low_query_diversity_without_grounding"
+        else:
+            state = "EXHAUSTED" if termination_reason else "ACTIVE"
+            reason = "terminated_before_required_relation_grounded" if termination_reason else "relation_not_yet_grounded"
+        episode_id = trace_logger.add_retrieval_episode({
+            "subgoal_id": sg_id,
+            "relation_id": relation_id,
+            "required_relation": predicate,
+            "query_decision_ids": list(dict.fromkeys(related_decision_ids)),
+            "plan_query_ids": list(dict.fromkeys(related_query_ids)),
+            "strategies": strategies,
+            "query_diversity": query_diversity,
+            "returned_evidence_count": len(delivered_spans),
+            "read_call_count": len(read_nodes),
+            "coverage_state": state,
+            "unresolved_reason": reason,
+            "termination_reason": termination_reason,
+        })
+        cov_id = trace_logger.add_coverage_assessment(episode_id, {
+            "subgoal_id": sg_id,
+            "relation_id": relation_id,
+            "required_relation": predicate,
+            "coverage_state": state,
+            "unresolved_reason": reason,
+            "query_decision_ids": list(dict.fromkeys(related_decision_ids)),
+            "plan_query_ids": list(dict.fromkeys(related_query_ids)),
+            "strategies": strategies,
+            "query_diversity": query_diversity,
+            "relation_specific_evidence_found": satisfied,
+            "termination_reason": termination_reason,
+            "repair_action": "retrieve_required_relation_with_new_strategy",
+        })
+        assessments.append(trace_logger._node(cov_id)["metadata"])
+    return assessments
 
 
 def _load_api_txt(path: str = "api.txt") -> Dict[str, str]:
@@ -302,10 +430,10 @@ class BatchRunner:
 
     def _load_completed_qids(self) -> set:
         """Load completed question IDs for checkpoint resume."""
-        completed_qids = set()
+        completed_ids = set()
 
         if not self.predictions_file.exists():
-            return completed_qids
+            return completed_ids
 
         try:
             with open(self.predictions_file, 'r', encoding='utf-8') as f:
@@ -316,15 +444,20 @@ class BatchRunner:
                     try:
                         data = json.loads(line)
                         if 'question' in data and 'pred_answer' in data:
-                            qid = data.get('qid') or data.get('id')
-                            if qid is not None:
-                                completed_qids.add(qid)
+                            completed_id = data.get('qid') or data.get('id') or data.get('sample_id')
+                            if completed_id is not None:
+                                completed_ids.add(str(completed_id))
                     except json.JSONDecodeError:
                         continue
         except Exception as e:
             print(f"Warning: Error loading completed data: {e}")
 
-        return completed_qids
+        return completed_ids
+
+    @staticmethod
+    def _sample_key(item: Dict[str, Any], sample_index: int) -> str:
+        explicit = item.get('qid') or item.get('id')
+        return str(explicit) if explicit is not None else f"sample_{sample_index:06d}"
 
     def _append_prediction(self, prediction: Dict[str, Any]):
         """Append prediction to file (thread-safe)."""
@@ -568,12 +701,30 @@ class BatchRunner:
         candidate_matrix = build_candidate_constraint_matrix(question_plan, hypothesis_assessments)
 
         scorer = ClaimSupportScorer(self._verification_backend(), cfg)
-        preliminary_subgoals = [sg.__dict__ for sg in question_plan.subgoals]
-        dep_supports = {sg["subgoal_id"]: 0.0 for sg in preliminary_subgoals if sg.get("required")}
+        preliminary_assessments = []
+        for claim in claims:
+            preliminary_assessments.append(scorer.score(
+                claim,
+                spans,
+                delivered_span_ids,
+                parent_supports=None,
+                dependency_ids=[],
+                blocked_dependency_ids=[],
+                plan_semantic_valid=question_plan.semantic_valid,
+            ))
+        preliminary_props = extract_structured_propositions(question_plan, spans, preliminary_assessments, result.get("answer", ""))
+        preliminary_groundings = ground_relations(question_plan, preliminary_props)
+        preliminary_subgoals = _resolve_subgoals(question_plan, preliminary_assessments, {"slot_coverage": 0}, preliminary_groundings)
+        dep_supports = _subgoal_supports(preliminary_subgoals, cfg)
+        preliminary_by_claim_id = {
+            a.get("claim", {}).get("claim_id"): a for a in preliminary_assessments
+        }
+
         assessments = []
         for claim in claims:
             parent_supports = [dep_supports.get(dep, 0.0) for dep in claim.dependencies] if claim.dependencies else None
             blocked_dep_ids = [dep for dep in (claim.dependencies or []) if dep_supports.get(dep, 0.0) < cfg.dependency_threshold]
+            preliminary = preliminary_by_claim_id.get(claim.claim_id, {})
             assessments.append(scorer.score(
                 claim,
                 spans,
@@ -582,6 +733,7 @@ class BatchRunner:
                 dependency_ids=claim.dependencies,
                 blocked_dependency_ids=blocked_dep_ids,
                 plan_semantic_valid=question_plan.semantic_valid,
+                verification_result=_verification_result_from_assessment(preliminary) if preliminary else None,
             ))
         for assessment in assessments:
             claim_node_id = trace_logger.add_claim_assessment(assessment, generated_by=answer_node)
@@ -594,14 +746,43 @@ class BatchRunner:
         subgoal_assessments = _resolve_subgoals(question_plan, assessments, answer_assessment, relation_groundings)
         unresolved_required = [sg["subgoal_id"] for sg in subgoal_assessments if sg.get("required") and str(sg.get("status", "")).upper() != "RESOLVED"]
         failure_types = infer_failure_types(answer_assessment, hypothesis_assessments, subgoal_assessments)
+        for warning in question_plan.validation_warnings:
+            if warning in {"PLAN_UNDERDECOMPOSED", "PLAN_AMBIGUOUS", "PLAN_UNMAPPED_CONSTRAINT"}:
+                failure_types.append(warning)
+        failure_types = list(dict.fromkeys(failure_types))
         root_bad = failure_frontier(assessments)
+        consistency_errors = []
+        if root_bad and not failure_types:
+            consistency_errors.append("ROOT_BAD_CLAIMS_WITHOUT_FAILURE_TYPES")
+        satisfied_grounding_subgoals = {
+            g.get("subgoal_id") for g in relation_groundings
+            if g.get("status") == "SATISFIED" and g.get("supporting_evidence_ids")
+        }
+        for sg in subgoal_assessments:
+            if str(sg.get("status", "")).upper() == "RESOLVED" and sg.get("subgoal_id") not in satisfied_grounding_subgoals:
+                consistency_errors.append(f"SUBGOAL_RESOLVED_WITHOUT_VERIFIED_GROUNDING:{sg.get('subgoal_id')}")
+        unsupported_claim_ids = {
+            a.get("claim", {}).get("claim_id") for a in assessments
+            if a.get("evidence_status") in {"UNSUPPORTED", "CONTRADICTED", "INVALID_PROVENANCE"}
+        }
+        if answer_assessment.get("support_status") == "VERIFIED" and answer_assessment.get("critical_answer_claim_id") in unsupported_claim_ids:
+            consistency_errors.append("ANSWER_VERIFIED_FROM_UNSUPPORTED_CLAIM")
+        if consistency_errors:
+            failure_types = list(dict.fromkeys(failure_types + ["TRACE_CONSISTENCY_ERROR"]))
         final_support = min((a["raw_score"] for a in assessments if a["claim"].get("criticality", 1.0) > 0), default=None)
+        coverage_assessments = _annotate_retrieval_coverage(
+            trace_logger,
+            question_plan,
+            subgoal_assessments,
+            relation_groundings,
+            result.get("termination_reason", ""),
+        )
         trace = trace_logger.to_dict()
         blame = []
-        root_bad_hypotheses = [
+        root_bad_hypotheses = list(dict.fromkeys(
             e["hypothesis_id"] for e in commitment_events
             if e.get("is_premature") and "PREMATURE_ENTITY_COMMITMENT" in failure_types
-        ][:3]
+        ))[:3]
         if failure_types:
             blame = BlameEngine().score_cognitive(
                 failure_types,
@@ -645,6 +826,11 @@ class BatchRunner:
                 inherited_claim_ids=[a["claim"]["claim_id"] for a in assessments if a["status"] == "VERIFIED"],
                 inherited_evidence_ids=list(dict.fromkeys(delivered_span_ids)),
                 constraints=[rejected_hypothesis(root_bad[0], "low_support", best["node_id"], "root bad claim under current evidence")],
+                inherited_nodes=[a.get("claim_node_id") for a in assessments if a["status"] == "VERIFIED" and a.get("claim_node_id")],
+                invalidated_node_ids=best.get("affected_downstream_nodes", []),
+                active_unresolved_subgoals=unresolved_required,
+                repair_instruction="rollback before candidate root and re-solve only affected unresolved subgoals",
+                branch_budget=int(best.get("repair_cost", 1) or 1),
             )
             # This conservative controller only selects a repair branch after an
             # executor has completed it. Until then b0 remains selected.
@@ -688,12 +874,15 @@ class BatchRunner:
             "candidate_constraint_matrix": candidate_matrix,
             "structured_propositions": structured_propositions,
             "relation_groundings": relation_groundings,
+            "coverage_assessments": coverage_assessments,
             "failure_frontier": root_bad,
             "final_claim_support": final_support,
             "root_bad_claims": root_bad,
             "root_bad_hypotheses": root_bad_hypotheses,
             "unresolved_required_subgoals": unresolved_required,
             "failure_types": failure_types,
+            "plan_validation_warnings": question_plan.validation_warnings,
+            "consistency_errors": consistency_errors,
             "blame_results": blame,
             "repair_plan": repair_plan,
             "repair_history": repair_history,
@@ -719,7 +908,7 @@ class BatchRunner:
     ) -> Dict[str, Any]:
         """Process one question."""
         qid = item.get('qid') or item.get('id')
-        sample_id = qid if qid is not None else f"sample_{sample_index:06d}"
+        sample_id = self._sample_key(item, sample_index)
         safe_sample_id = self._safe_path_part(sample_id)
 
         question = item.get('question', '')
@@ -762,6 +951,7 @@ class BatchRunner:
 
             return {
                 'qid': qid,
+                'sample_id': str(sample_id),
                 'question': question,
                 'trajectory': result['trajectory'],
                 'gold_answer': gold_answer,
@@ -798,6 +988,7 @@ class BatchRunner:
 
             return {
                 'qid': qid,
+                'sample_id': str(sample_id),
                 'question': question,
                 'trajectory': [],
                 'gold_answer': gold_answer,
@@ -820,13 +1011,15 @@ class BatchRunner:
 
     def run(self):
         """Run batch processing."""
-        completed_qids = self._load_completed_qids()
+        completed_ids = self._load_completed_qids()
 
-        pending = [q for q in self.questions
-                   if (q.get('qid') or q.get('id')) not in completed_qids]
+        pending = [
+            (idx, q) for idx, q in enumerate(self.questions)
+            if self._sample_key(q, idx) not in completed_ids
+        ]
 
         print(f"Total questions: {len(self.questions)}")
-        print(f"Completed: {len(completed_qids)}")
+        print(f"Completed: {len(completed_ids)}")
         print(f"Pending: {len(pending)}")
 
         if not pending:
@@ -838,10 +1031,10 @@ class BatchRunner:
         with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
             futures = {}
 
-            for sample_index, item in enumerate(pending):
+            for sample_index, item in pending:
                 agent = self._create_agent()
                 future = executor.submit(self._process_one, item, agent, sample_index)
-                futures[future] = item.get('qid') or item.get('id')
+                futures[future] = self._sample_key(item, sample_index)
 
             with tqdm(total=len(pending), desc="Processing") as pbar:
                 for future in as_completed(futures):

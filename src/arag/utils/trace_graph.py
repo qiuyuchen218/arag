@@ -7,24 +7,25 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from arag.core.schemas import stable_hash
 from arag.utils.trace_error import normalize_error
 
 
 class TraceGraph:
     """Execution-only trace graph for one QA sample."""
 
-    trace_schema_version = "2.0"
-    EVENT_TYPES = {"question", "llm_call", "plan_query", "retriever_call", "read_call", "context_snapshot", "branch_fork", "evaluation", "answer", "error"}
+    trace_schema_version = "2.1"
+    EVENT_TYPES = {"question", "llm_call", "decision_record", "epistemic_state_event", "retrieval_episode", "coverage_assessment", "plan_query", "retriever_call", "read_call", "context_snapshot", "branch_fork", "evaluation", "answer", "error"}
     ARTIFACT_TYPES = {"document", "retrieved_chunk", "evidence_span", "tool_result", "answer"}
-    EPISTEMIC_TYPES = {"subgoal", "claim", "evidence_set", "hypothesis", "constraint", "query_intent", "commitment_event"}
+    EPISTEMIC_TYPES = {"subgoal", "claim", "evidence_set", "evidence_assessment", "proposition", "hypothesis", "constraint", "query_intent", "commitment_event"}
     NODE_TYPES = EVENT_TYPES | ARTIFACT_TYPES | EPISTEMIC_TYPES
     EDGE_TYPES = {
         "next", "next_in_branch", "invokes", "executes", "returns", "retrieves", "reads",
-        "contains", "consumes", "consumed_by", "generates", "delivered_in_context",
+        "contains", "consumes", "consumed_by", "emits", "generates", "delivered_in_context",
         "delivered_into", "available_in_context",
-        "cites", "member_of", "supports", "contradicts", "jointly_supports", "depends_on",
-        "answers_subgoal", "decomposes_to", "targets_subgoal", "proposed_for",
-        "proposes", "motivates", "queries_for", "updates", "resolves_candidate_for", "influences",
+        "cites", "member_of", "supports", "supports_or_informs", "contradicts", "jointly_supports", "depends_on",
+        "answers_subgoal", "decomposes_to", "targets_subgoal", "proposed_for", "has_state", "used_as_premise_by", "assessed_against", "aggregates_query", "has_coverage",
+        "proposes", "expresses", "motivates", "queries_for", "updates", "resolves_candidate_for", "influences",
         "forked_from", "inherits", "invalidates", "rejects", "supersedes",
         "failed_with", "evaluates",
     }
@@ -50,6 +51,8 @@ class TraceGraph:
         self.edges: List[Dict[str, Any]] = []
         self._type_counters: Dict[str, int] = {}
         self._step_counter = 0
+        self._event_seq_counter = 0
+        self._branch_seq_counters: Dict[str, int] = {}
         self._artifact_counter = 0
         self._last_event_id = None
         self._chunk_index: Dict[str, str] = {}
@@ -91,7 +94,8 @@ class TraceGraph:
             "document": "doc", "evidence_span": "span", "tool_result": "toolres",
             "subgoal": "sg", "claim": "claim", "evidence_set": "evset",
             "hypothesis": "hyp", "constraint": "con", "query_intent": "qi",
-            "commitment_event": "commit",
+            "commitment_event": "commit", "decision_record": "dec",
+            "epistemic_state_event": "estate", "proposition": "prop", "evidence_assessment": "evassess",
             "answer": "ans", "error": "err",
         }
         self._type_counters[node_type] = self._type_counters.get(node_type, 0) + 1
@@ -111,18 +115,25 @@ class TraceGraph:
         node_id = node_id or self._new_id(node_type)
         if any(node["id"] == node_id for node in self.nodes):
             raise ValueError(f"Duplicate trace node id: {node_id}")
+        branch_id = metadata.get("branch_id", "b0")
+        now = self.timestamp()
         node = {
             "id": node_id,
             "type": node_type,
             "content": self._clean_json(content),
             "metadata": metadata,
-            "timestamp": self.timestamp(),
+            "timestamp": now,
+            "created_at": now,
             "status": status,
-            "branch_id": metadata.get("branch_id", "b0"),
+            "branch_id": branch_id,
         }
         if node_type in self.EVENT_TYPES:
             self._step_counter += 1
+            self._event_seq_counter += 1
+            self._branch_seq_counters[branch_id] = self._branch_seq_counters.get(branch_id, 0) + 1
             node["step_index"] = self._step_counter
+            node["event_seq"] = self._event_seq_counter
+            node["branch_seq"] = self._branch_seq_counters[branch_id]
         else:
             self._artifact_counter += 1
             node["created_index"] = self._artifact_counter
@@ -141,7 +152,7 @@ class TraceGraph:
             return
         if edge_type not in self.EDGE_TYPES:
             raise ValueError(f"Unsupported trace edge type: {edge_type}")
-        metadata = self._clean_json(metadata or {})
+        metadata = self._edge_metadata_with_semantics(source, target, edge_type, self._clean_json(metadata or {}))
         if edge_type == "available_in_context":
             key = (source, target, edge_type)
             if key in self._context_edge_index:
@@ -158,6 +169,41 @@ class TraceGraph:
         self.edges.append(edge)
         if edge_type == "available_in_context":
             self._context_edge_index[(source, target, edge_type)] = edge
+
+    def _edge_metadata_with_semantics(self, source: str, target: str, edge_type: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        causal_types = {
+            "next", "next_in_branch", "consumed_by", "emits", "motivates", "executes",
+            "returns", "delivered_into", "failed_with", "evaluates", "used_as_premise_by",
+        }
+        inferred_types = {"expresses", "proposes", "updates"}
+        provenance_types = {
+            "invokes", "retrieves", "reads", "contains", "member_of", "jointly_supports",
+            "delivered_in_context", "available_in_context", "supports", "supports_or_informs",
+            "cites", "answers_subgoal", "decomposes_to", "targets_subgoal", "proposed_for",
+            "has_state", "assessed_against",
+            "depends_on", "generates", "queries_for", "resolves_candidate_for", "influences",
+            "forked_from", "inherits", "invalidates", "rejects", "supersedes",
+        }
+        metadata.setdefault("timestamp", self.timestamp())
+        source_node = next((n for n in self.nodes if n["id"] == source), {})
+        target_node = next((n for n in self.nodes if n["id"] == target), {})
+        event_to_event = source_node.get("type") in self.EVENT_TYPES and target_node.get("type") in self.EVENT_TYPES
+        if edge_type in causal_types and event_to_event:
+            metadata.setdefault("causal", True)
+            metadata.setdefault("inferred", False)
+            metadata.setdefault("edge_class", "causal")
+        elif edge_type in inferred_types:
+            metadata.setdefault("causal", False)
+            metadata.setdefault("inferred", True)
+            metadata.setdefault("edge_class", "inferred")
+        elif edge_type in provenance_types:
+            metadata.setdefault("causal", False)
+            metadata.setdefault("inferred", False)
+            metadata.setdefault("edge_class", "artifact/provenance")
+        else:
+            metadata.setdefault("causal", False)
+            metadata.setdefault("inferred", False)
+        return metadata
 
     def link_event_next(self, target: str, metadata: Optional[Dict[str, Any]] = None):
         target_node = self._node(target)
@@ -240,6 +286,7 @@ class TraceGraph:
         call_order: int = 1,
         raw_arguments: str = None,
         arguments_parse_error: str = None,
+        decision_id: str = None,
     ) -> str:
         metadata = {
             "loop": loop, "source": "tool_call_argument", "tool_name": tool_name,
@@ -251,8 +298,182 @@ class TraceGraph:
             "loop": loop, "tool_call_id": tool_call_id, "tool_name": tool_name,
             "call_order": call_order, "timestamp": self.timestamp(),
         })
+        if decision_id:
+            self.add_edge(decision_id, node_id, "motivates", {
+                "loop": loop, "tool_call_id": tool_call_id, "tool_name": tool_name,
+                "call_order": call_order, "timestamp": self.timestamp(),
+            })
         self.link_event_next(node_id)
         return node_id
+
+    def add_decision_record(
+        self,
+        llm_id: str,
+        decision: Dict[str, Any],
+        input_context_node: str = None,
+        visible_evidence_ids: Optional[List[str]] = None,
+    ) -> str:
+        decision = self._clean_json(decision)
+        node_id = decision.get("decision_id") or self._new_id("decision_record")
+        if any(n["id"] == node_id for n in self.nodes):
+            return node_id
+        decision.setdefault("extractor_mode", "inferred")
+        decision.setdefault("authoritative", False)
+        decision.setdefault("branch_id", "b0")
+        if llm_id:
+            decision.setdefault("generated_by_llm_call_id", llm_id)
+        added = self.add_node(
+            "decision_record",
+            decision.get("query_or_action") or decision.get("decision_type", ""),
+            decision,
+            status=decision.get("decision_type", "recorded"),
+            node_id=node_id,
+        )
+        if input_context_node and any(n["id"] == input_context_node for n in self.nodes):
+            self.add_edge(input_context_node, added, "consumed_by", {
+                "semantics": "decision_used_visible_context",
+                "timestamp": self.timestamp(),
+            })
+        if llm_id and any(n["id"] == llm_id for n in self.nodes):
+            self.add_edge(llm_id, added, "emits", {"timestamp": self.timestamp()})
+        for span_id in visible_evidence_ids or []:
+            if span_id and any(n["id"] == span_id for n in self.nodes):
+                self.add_edge(span_id, added, "supports_or_informs", {
+                    "semantics": "visible_before_decision_not_proven_used",
+                    "timestamp": self.timestamp(),
+                })
+        self.link_event_next(added)
+        return added
+
+    def add_proposition_node(self, proposition: Dict[str, Any]) -> str:
+        proposition = self._clean_json(proposition)
+        subject = proposition.get("subject", "")
+        predicate = proposition.get("predicate", "")
+        obj = proposition.get("object", "")
+        identity = {
+            "subject": self._normalize_prop_part(subject),
+            "predicate": self._normalize_prop_part(predicate),
+            "object": self._normalize_prop_part(obj),
+        }
+        node_id = proposition.get("proposition_id") or f"prop_{stable_hash(identity)}"
+        if any(n["id"] == node_id for n in self.nodes):
+            node = self._node(node_id)
+            node["metadata"].setdefault("relation_ids", [])
+            rel = proposition.get("relation_id")
+            if rel and rel not in node["metadata"]["relation_ids"]:
+                node["metadata"]["relation_ids"].append(rel)
+            return node_id
+        return self.add_node(
+            "proposition",
+            f"{subject} --{predicate}--> {obj}",
+            {
+                **proposition,
+                "proposition_id": node_id,
+                "canonical_identity": identity,
+                "relation_ids": [proposition.get("relation_id")] if proposition.get("relation_id") else [],
+                "immutable": True,
+            },
+            status="open",
+            node_id=node_id,
+        )
+
+    @staticmethod
+    def _normalize_prop_part(value: Any) -> str:
+        text = " ".join(str(value or "").lower().split())
+        return "".join(ch for ch in text if ch.isalnum() or ch.isspace() or ch in "_-").strip()
+
+    def latest_epistemic_state(self, proposition_id: str) -> str:
+        latest = None
+        latest_seq = -1
+        for edge in self.edges:
+            if edge.get("type") != "has_state" or edge.get("source") != proposition_id:
+                continue
+            node = next((n for n in self.nodes if n["id"] == edge.get("target")), None)
+            if node and int(node.get("event_seq") or 0) > latest_seq:
+                latest = node.get("metadata", {}).get("new_state")
+                latest_seq = int(node.get("event_seq") or 0)
+        return latest or "UNKNOWN"
+
+    def add_epistemic_state_event(
+        self,
+        proposition_id: str,
+        new_state: str,
+        generated_by_decision_id: str = None,
+        available_evidence_ids: Optional[List[str]] = None,
+        support_score_at_event: float = 0.0,
+        missing_constraint_ids: Optional[List[str]] = None,
+        authoritative: bool = False,
+        extractor_mode: str = "inferred",
+        action_role: str = None,
+    ) -> str:
+        previous_state = self.latest_epistemic_state(proposition_id)
+        node_id = f"estate_{stable_hash(proposition_id, new_state, generated_by_decision_id, len(self.nodes))}"
+        event = {
+            "proposition_id": proposition_id,
+            "previous_state": previous_state,
+            "new_state": new_state,
+            "available_evidence_ids": list(dict.fromkeys(available_evidence_ids or [])),
+            "support_score_at_event": support_score_at_event,
+            "missing_constraint_ids": list(dict.fromkeys(missing_constraint_ids or [])),
+            "generated_by_decision_id": generated_by_decision_id,
+            "authoritative": authoritative,
+            "extractor_mode": extractor_mode,
+            "action_role": action_role,
+        }
+        added = self.add_node("epistemic_state_event", f"{previous_state}->{new_state}", event, status=new_state, node_id=node_id)
+        if proposition_id and any(n["id"] == proposition_id for n in self.nodes):
+            self.add_edge(proposition_id, added, "has_state", {"timestamp": self.timestamp()})
+        if generated_by_decision_id and new_state in {"COMMITTED", "USED_AS_PREMISE"} and any(n["id"] == generated_by_decision_id for n in self.nodes):
+            self.link_state_event_to_decision(added, generated_by_decision_id)
+        self.link_event_next(added)
+        return added
+
+    def link_state_event_to_decision(self, state_event_id: str, decision_id: str):
+        if not state_event_id or not decision_id:
+            return
+        if not any(n["id"] == state_event_id for n in self.nodes) or not any(n["id"] == decision_id for n in self.nodes):
+            return
+        state = self._node(state_event_id)
+        decision = self._node(decision_id)
+        if (state.get("event_seq") or 0) >= (decision.get("event_seq") or 0):
+            return
+        if any(e["source"] == state_event_id and e["target"] == decision_id and e["type"] == "used_as_premise_by" for e in self.edges):
+            return
+        new_state = state.get("metadata", {}).get("new_state")
+        self.add_edge(state_event_id, decision_id, "used_as_premise_by", {
+            "timestamp": self.timestamp(),
+            "epistemic_force": 1.0 if new_state == "USED_AS_PREMISE" else 0.8,
+        })
+
+    def add_evidence_assessment(
+        self,
+        proposition_id: str,
+        decision_id: str,
+        evidence_span_ids: List[str],
+        assessment: Dict[str, Any],
+    ) -> str:
+        assessment = self._clean_json(assessment)
+        node_id = f"evassess_{stable_hash(proposition_id, decision_id, evidence_span_ids, assessment)}"
+        if any(n["id"] == node_id for n in self.nodes):
+            return node_id
+        added = self.add_node(
+            "evidence_assessment",
+            assessment.get("status", "UNKNOWN"),
+            {
+                **assessment,
+                "proposition_id": proposition_id,
+                "decision_id": decision_id,
+                "evidence_span_ids": list(dict.fromkeys(evidence_span_ids or [])),
+            },
+            status=assessment.get("status", "UNKNOWN"),
+            node_id=node_id,
+        )
+        if proposition_id and any(n["id"] == proposition_id for n in self.nodes):
+            self.add_edge(added, proposition_id, "assessed_against", {"timestamp": self.timestamp()})
+        for span_id in evidence_span_ids or []:
+            if span_id and any(n["id"] == span_id for n in self.nodes):
+                self.add_edge(span_id, added, "supports_or_informs", {"timestamp": self.timestamp()})
+        return added
 
     def add_retriever_call(
         self,
@@ -499,9 +720,15 @@ class TraceGraph:
             self.add_edge(added, target, "proposed_for", {"timestamp": self.timestamp()})
         source = hypothesis.get("source_event_id") or hypothesis.get("generated_by")
         if source and any(n["id"] == source for n in self.nodes):
-            self.add_edge(source, added, "proposes", {"timestamp": self.timestamp()})
-            if self._node(source)["type"] == "plan_query" and not hypothesis.get("posthoc_summary"):
-                self.add_edge(added, source, "motivates", {"timestamp": self.timestamp()})
+            if self._node(source)["type"] == "plan_query":
+                self.add_edge(source, added, "expresses", {
+                    "timestamp": self.timestamp(),
+                    "causal": False,
+                    "inferred": True,
+                    "semantics": "query_text_posthoc_expresses_candidate",
+                })
+            else:
+                self.add_edge(source, added, "proposes", {"timestamp": self.timestamp()})
         return added
 
     def add_query_intent_node(self, intent: Dict[str, Any]) -> str:
@@ -518,6 +745,59 @@ class TraceGraph:
             self.add_edge(added, sg, "targets_subgoal", {"timestamp": self.timestamp()})
         return added
 
+    def add_retrieval_episode(self, episode: Dict[str, Any]) -> str:
+        episode = self._clean_json(episode)
+        node_id = episode.get("retrieval_episode_id") or f"ret_episode_{stable_hash(episode.get('subgoal_id'), episode.get('relation_id'), episode.get('query_decision_ids', []))}"
+        if any(n["id"] == node_id for n in self.nodes):
+            node = self._node(node_id)
+            node["metadata"].update(episode)
+            return node_id
+        added = self.add_node(
+            "retrieval_episode",
+            episode.get("required_relation") or episode.get("relation_id") or episode.get("subgoal_id", ""),
+            episode,
+            status=episode.get("coverage_state", "ACTIVE"),
+            node_id=node_id,
+        )
+        for qid in episode.get("query_decision_ids", []) or []:
+            if qid and any(n["id"] == qid for n in self.nodes):
+                self.add_edge(qid, added, "aggregates_query", {"timestamp": self.timestamp(), "causal": True})
+        sg = episode.get("subgoal_id")
+        if sg and any(n["id"] == sg for n in self.nodes):
+            self.add_edge(added, sg, "targets_subgoal", {
+                "timestamp": self.timestamp(),
+                "causal": False,
+                "inferred": True,
+                "semantics": "coverage_episode_groups_attempts_for_subgoal",
+            })
+        self.link_event_next(added)
+        return added
+
+    def add_coverage_assessment(self, episode_id: str, assessment: Dict[str, Any]) -> str:
+        assessment = self._clean_json(assessment)
+        node_id = assessment.get("coverage_assessment_id") or f"coverage_{stable_hash(episode_id, assessment)}"
+        if any(n["id"] == node_id for n in self.nodes):
+            return node_id
+        added = self.add_node(
+            "coverage_assessment",
+            assessment.get("coverage_state", "UNKNOWN"),
+            {**assessment, "retrieval_episode_id": episode_id},
+            status=assessment.get("coverage_state", "UNKNOWN"),
+            node_id=node_id,
+        )
+        if episode_id and any(n["id"] == episode_id for n in self.nodes):
+            self.add_edge(episode_id, added, "has_coverage", {"timestamp": self.timestamp(), "causal": True})
+        sg = assessment.get("subgoal_id")
+        if sg and any(n["id"] == sg for n in self.nodes):
+            self.add_edge(added, sg, "targets_subgoal", {
+                "timestamp": self.timestamp(),
+                "causal": False,
+                "inferred": True,
+                "semantics": "coverage_assessment_describes_subgoal_status",
+            })
+        self.link_event_next(added)
+        return added
+
     def add_commitment_event_node(self, event: Dict[str, Any]) -> str:
         event = self._clean_json(event)
         node_id = event.get("commitment_event_id") or self._new_id("commitment_event")
@@ -529,7 +809,12 @@ class TraceGraph:
             self.add_edge(hyp, added, "generates", {"timestamp": self.timestamp()})
         source = event.get("source_event_id")
         if source and any(n["id"] == source for n in self.nodes):
-            self.add_edge(added, source, "motivates", {"timestamp": self.timestamp()})
+            self.add_edge(source, added, "expresses", {
+                "timestamp": self.timestamp(),
+                "causal": False,
+                "inferred": True,
+                "semantics": "query_or_text_posthoc_expresses_commitment",
+            })
         target = event.get("target_subgoal_id")
         if target and any(n["id"] == target for n in self.nodes):
             self.add_edge(added, target, "proposed_for", {"timestamp": self.timestamp()})
@@ -670,6 +955,10 @@ class TraceGraph:
 
     def validate_v2(self):
         errors = []
+        temporal_errors = []
+        causal_errors = []
+        provenance_errors = []
+        diagnosis_blocking = []
         id_set = {node["id"] for node in self.nodes}
         by_id = {node["id"]: node for node in self.nodes}
         event_types = self.EVENT_TYPES
@@ -682,16 +971,16 @@ class TraceGraph:
                     errors.append(f"duplicate_delivered_span_ids:{node['id']}")
                 missing = [sid for sid in delivered if sid not in id_set]
                 if missing:
-                    errors.append(f"missing_delivered_span:{node['id']}:{missing[:3]}")
+                    provenance_errors.append(f"missing_delivered_span:{node['id']}:{missing[:3]}")
             if node["type"] == "evidence_span":
                 md = node.get("metadata", {})
                 text = str(node.get("content", "") or "")
                 start = md.get("start_offset", 0) or 0
                 end = md.get("end_offset", 0) or 0
                 if end and start and int(end) < int(start):
-                    errors.append(f"invalid_span_offsets:{node['id']}")
+                    provenance_errors.append(f"invalid_span_offsets:{node['id']}")
                 if md.get("sentence_id") is None and len(text) > 800:
-                    errors.append(f"duplicate_full_chunk_span:{node['id']}")
+                    provenance_errors.append(f"duplicate_full_chunk_span:{node['id']}")
         identities = {}
         for node in self.nodes:
             if node["type"] != "evidence_span":
@@ -706,7 +995,7 @@ class TraceGraph:
                 md.get("content_hash") or node.get("content"),
             )
             if identity in identities:
-                errors.append(f"duplicate_artifact_identity:{identities[identity]}:{node['id']}")
+                provenance_errors.append(f"duplicate_artifact_identity:{identities[identity]}:{node['id']}")
             identities[identity] = node["id"]
         for node in self.nodes:
             if node["type"] != "claim":
@@ -721,32 +1010,45 @@ class TraceGraph:
                 ev_ids = set(evset.get("metadata", {}).get("evidence_span_ids", []) or [])
                 in_ids = set(md.get("verifier_input_span_ids", []) or [])
                 if ev_ids != in_ids:
-                    errors.append(f"evidence_set_verifier_leak:{node['id']}")
+                    provenance_errors.append(f"evidence_set_verifier_leak:{node['id']}")
             if md.get("evidence_isolation_valid") is False:
-                errors.append(f"evidence_isolation_invalid:{node['id']}")
+                provenance_errors.append(f"evidence_isolation_invalid:{node['id']}")
             claim = md
             resolves_subgoal = bool(claim.get("resolves_subgoal_ids"))
             if claim.get("claim_type") in {"answer_claim", "factual_claim"} and not claim.get("dependencies") and not resolves_subgoal:
                 errors.append(f"missing_expected_dependency:{node['id']}")
         for edge in self.edges:
+            source = by_id.get(edge["source"], {})
+            target = by_id.get(edge["target"], {})
+            if edge.get("metadata", {}).get("causal"):
+                s_seq = source.get("event_seq")
+                t_seq = target.get("event_seq")
+                if s_seq is None or t_seq is None:
+                    causal_errors.append(f"causal_edge_non_event_endpoint:{edge['source']}->{edge['target']}")
+                elif int(s_seq) >= int(t_seq):
+                    causal_errors.append(f"CAUSAL_EDGE_TIME_REVERSAL:{edge['source']}->{edge['target']}")
+                if source.get("branch_id", "b0") != target.get("branch_id", "b0"):
+                    causal_errors.append(f"causal_edge_cross_branch:{edge['source']}->{edge['target']}")
+            if edge.get("metadata", {}).get("inferred") and edge.get("metadata", {}).get("causal"):
+                causal_errors.append(f"inferred_edge_marked_causal:{edge['source']}->{edge['target']}")
             if edge["type"] == "next_in_branch":
                 s, t = by_id[edge["source"]], by_id[edge["target"]]
                 if s.get("branch_id", "b0") != t.get("branch_id", "b0"):
-                    errors.append(f"next_in_branch_cross_branch:{edge['source']}->{edge['target']}")
+                    temporal_errors.append(f"next_in_branch_cross_branch:{edge['source']}->{edge['target']}")
             if edge["type"] == "consumed_by":
                 s, t = by_id[edge["source"]], by_id[edge["target"]]
-                if s["type"] != "context_snapshot" or t["type"] != "llm_call":
+                if s["type"] != "context_snapshot" or t["type"] not in {"llm_call", "decision_record"}:
                     errors.append(f"bad_consumed_by:{edge['source']}->{edge['target']}")
                 if (s.get("step_index") or 0) >= (t.get("step_index") or 0):
-                    errors.append(f"context_not_before_llm:{edge['source']}->{edge['target']}")
+                    temporal_errors.append(f"context_not_before_llm:{edge['source']}->{edge['target']}")
             if edge["type"] in {"proposes", "motivates", "generates", "updates", "executes", "returns", "targets_subgoal"}:
                 s, t = by_id[edge["source"]], by_id[edge["target"]]
                 s_step = s.get("step_index") or s.get("metadata", {}).get("step_index") or s.get("metadata", {}).get("first_proposed_at")
                 t_step = t.get("step_index") or t.get("metadata", {}).get("step_index") or t.get("metadata", {}).get("first_proposed_at")
                 if s_step is not None and t_step is not None and int(s_step) > int(t_step):
-                    errors.append(f"causal_edge_temporal_invalid:{edge['source']}->{edge['target']}")
+                    temporal_errors.append(f"causal_edge_temporal_invalid:{edge['source']}->{edge['target']}")
                 if s.get("branch_id", "b0") != t.get("branch_id", "b0"):
-                    errors.append(f"causal_edge_cross_branch:{edge['source']}->{edge['target']}")
+                    causal_errors.append(f"causal_edge_cross_branch:{edge['source']}->{edge['target']}")
         incoming_next = {}
         outgoing_next = {}
         for edge in self.edges:
@@ -755,43 +1057,65 @@ class TraceGraph:
                 outgoing_next[edge["source"]] = outgoing_next.get(edge["source"], 0) + 1
         for node_id, count in incoming_next.items():
             if count > 1:
-                errors.append(f"multiple_next_predecessors:{node_id}")
+                temporal_errors.append(f"multiple_next_predecessors:{node_id}")
         for node_id, count in outgoing_next.items():
             if count > 1:
-                errors.append(f"multiple_next_successors:{node_id}")
+                temporal_errors.append(f"multiple_next_successors:{node_id}")
         for node in self.nodes:
             if node["type"] == "evidence_set":
                 span_ids = node.get("metadata", {}).get("evidence_span_ids", []) or []
                 missing = [sid for sid in span_ids if sid not in id_set]
                 if missing:
-                    errors.append(f"evidence_set_missing_span:{node['id']}:{missing[:3]}")
+                    provenance_errors.append(f"evidence_set_missing_span:{node['id']}:{missing[:3]}")
                 docs = sorted({by_id[sid].get("metadata", {}).get("doc_id") for sid in span_ids if sid in by_id})
                 docs = [str(d) for d in docs if d is not None]
                 expected = sorted(str(d) for d in (node.get("metadata", {}).get("unique_doc_ids", []) or []))
                 if docs != expected:
-                    errors.append(f"evidence_set_doc_mismatch:{node['id']}")
+                    provenance_errors.append(f"evidence_set_doc_mismatch:{node['id']}")
         repair_plan = self.metadata.get("repair_plan") or {}
         root = repair_plan.get("root_cause_node")
         rollback = repair_plan.get("rollback_checkpoint")
         if root and root in by_id:
             if by_id[root].get("metadata", {}).get("posthoc_summary"):
-                errors.append(f"root_is_posthoc_summary:{root}")
+                diagnosis_blocking.append(f"POSTHOC_EDGE_USED_FOR_BLAME:{root}")
             if rollback and rollback in by_id:
                 r_step = by_id[root].get("step_index") or by_id[root].get("metadata", {}).get("step_index") or by_id[root].get("metadata", {}).get("first_proposed_at")
                 rb_step = by_id[rollback].get("step_index") or by_id[rollback].get("metadata", {}).get("step_index")
                 if r_step is not None and rb_step is not None and int(rb_step) >= int(r_step):
-                    errors.append(f"rollback_not_before_root:{rollback}:{root}")
+                    diagnosis_blocking.append(f"rollback_not_before_root:{rollback}:{root}")
                 root_llm = repair_plan.get("root_generator_llm")
                 if root_llm:
                     consumed = any(e["type"] == "consumed_by" and e["source"] == rollback and e["target"] == root_llm for e in self.edges)
                     if not consumed:
-                        errors.append(f"rollback_not_consumed_by_root_generator:{rollback}:{root_llm}")
+                        diagnosis_blocking.append(f"rollback_not_consumed_by_root_generator:{rollback}:{root_llm}")
+        repair_plan = self.metadata.get("repair_plan") or {}
+        root = repair_plan.get("root_cause_node")
+        if root:
+            selected = next((b for b in self.metadata.get("blame_results", []) or [] if b.get("node_id") == root), {})
+            if not selected.get("full_causal_path_valid", selected.get("causal_path_valid", False)):
+                diagnosis_blocking.append("NO_EXECUTION_PATH_TO_FAILURE")
+        errors.extend(temporal_errors)
+        errors.extend(causal_errors)
+        errors.extend(provenance_errors)
+        self.metadata["schema_valid"] = not any(e.startswith(("artifact_or_epistemic_step_index", "duplicate", "missing_expected_dependency", "bad_")) for e in errors)
+        self.metadata["temporal_valid"] = not temporal_errors
+        self.metadata["provenance_valid"] = not provenance_errors
+        self.metadata["causal_graph_valid"] = not causal_errors
+        self.metadata["repair_checkpoint_valid"] = not any("rollback" in e for e in diagnosis_blocking)
+        self.metadata["diagnosis_blocking_reasons"] = diagnosis_blocking
+        self.metadata["diagnosis_valid"] = not diagnosis_blocking and self.metadata["causal_graph_valid"]
         if errors:
             self.metadata["trace_valid"] = False
             self.metadata["validation_errors"] = errors
             raise ValueError("Trace v2 validation failed: " + "; ".join(errors[:5]))
         self.metadata["trace_valid"] = True
         self.metadata["validation_errors"] = []
+        self.metadata.setdefault("schema_valid", True)
+        self.metadata.setdefault("temporal_valid", True)
+        self.metadata.setdefault("provenance_valid", True)
+        self.metadata.setdefault("causal_graph_valid", True)
+        self.metadata.setdefault("diagnosis_valid", not self.metadata.get("diagnosis_blocking_reasons"))
+        self.metadata.setdefault("repair_checkpoint_valid", True)
 
     def to_dict(self) -> Dict[str, Any]:
         self.finalize_metadata()

@@ -1,6 +1,7 @@
 """Base agent implementation for ARAG."""
 
 import json
+import re
 from typing import Any, Dict, List
 
 import tiktoken
@@ -129,6 +130,7 @@ class BaseAgent:
         self,
         trace_logger: Any,
         analysis_node: str,
+        decision_node: str,
         func_name: str,
         func_args: Dict[str, Any],
         tool_result: str,
@@ -151,6 +153,7 @@ class BaseAgent:
                 analysis_node, query_text, func_name, func_args, loop_count,
                 tool_call_id=tool_call_id, call_order=call_order,
                 raw_arguments=raw_arguments, arguments_parse_error=arguments_parse_error,
+                decision_id=decision_node,
             )
         except Exception:
             return []
@@ -290,6 +293,284 @@ class BaseAgent:
 
         return evidence_nodes
 
+    def _trace_decision_record(
+        self,
+        trace_logger: Any,
+        analysis_node: str,
+        input_context_node: str,
+        func_name: str,
+        func_args: Dict[str, Any],
+        epistemic_context: Dict[str, Any],
+        loop_count: int,
+        call_order: int,
+        tool_call_id: str = None,
+        delivered_span_ids: List[str] = None,
+    ) -> str:
+        if trace_logger is None:
+            return None
+        query_text = self._query_from_tool_args(func_name, func_args)
+        operation = "read" if func_name in {"read_chunk", "read_chunks"} else "query_selection"
+        explicit = bool((epistemic_context or {}).get("explicit"))
+        action_role = str((epistemic_context or {}).get("action_role") or ("TEST" if operation == "query_selection" else "VERIFY")).upper()
+        decision = {
+            "decision_id": f"dec_{loop_count:03d}_{call_order:03d}",
+            "decision_type": "query_selection" if action_role not in {"COMMIT", "USE_AS_PREMISE"} else "binding_commitment",
+            "active_subgoal_ids": list((epistemic_context or {}).get("active_subgoal_ids") or []),
+            "target_relation_ids": [
+                p.get("relation_id") for p in self._epistemic_props(epistemic_context or {}, "targets")
+                if isinstance(p, dict) and p.get("relation_id")
+            ],
+            "premise_relation_ids": [
+                p.get("relation_id") for p in self._epistemic_props(epistemic_context or {}, "premises")
+                if isinstance(p, dict) and p.get("relation_id")
+            ],
+            "proposed_bindings": list(self._epistemic_props(epistemic_context or {}, "targets")),
+            "premises": list(self._epistemic_props(epistemic_context or {}, "premises")),
+            "selected_tool": func_name,
+            "query_or_action": query_text,
+            "public_reason_code": "explicit_epistemic_context" if explicit else "tool_call_selected_by_public_assistant_message",
+            "confidence": 0.7 if explicit else 0.35,
+            "tool_call_id": tool_call_id,
+            "loop": loop_count,
+            "call_order": call_order,
+            "action_role": action_role,
+            "extractor_mode": "explicit" if explicit else "inferred",
+            "authoritative": bool(explicit),
+        }
+        try:
+            pre_state_ids = []
+            operational_premises = self._detect_operational_premise_use(
+                func_name,
+                func_args,
+                epistemic_context or {},
+                action_role,
+            )
+            if operational_premises:
+                epistemic_context = {
+                    **(epistemic_context or {}),
+                    "premises": list(self._epistemic_props(epistemic_context or {}, "premises")) + operational_premises,
+                    "operational_role_mismatch": action_role in {"EXPLORE", "TEST", "VERIFY", "DISAMBIGUATE"},
+                }
+                decision["operational_premise_use_detected"] = True
+                decision["role_mismatch"] = epistemic_context["operational_role_mismatch"]
+                decision["premises"] = list(self._epistemic_props(epistemic_context or {}, "premises"))
+            if action_role in {"COMMIT", "USE_AS_PREMISE"} or operational_premises:
+                pre_state_ids = self._trace_epistemic_context(
+                    trace_logger,
+                    decision["decision_id"],
+                    epistemic_context or {},
+                    action_role,
+                    list(dict.fromkeys(delivered_span_ids or [])),
+                    authoritative=bool(explicit),
+                )
+            decision_id = trace_logger.add_decision_record(
+                analysis_node,
+                decision,
+                input_context_node=input_context_node,
+                visible_evidence_ids=delivered_span_ids or [],
+            )
+            for state_id in pre_state_ids:
+                trace_logger.link_state_event_to_decision(state_id, decision_id)
+            if action_role not in {"COMMIT", "USE_AS_PREMISE"}:
+                self._trace_epistemic_context(trace_logger, decision_id, epistemic_context or {}, action_role, list(dict.fromkeys(delivered_span_ids or [])), authoritative=bool(explicit))
+            return decision_id
+        except Exception:
+            return None
+
+    @staticmethod
+    def _epistemic_props(epistemic_context: Dict[str, Any], kind: str = "all") -> List[Dict[str, Any]]:
+        if not isinstance(epistemic_context, dict):
+            return []
+        props: List[Dict[str, Any]] = []
+        if kind in {"all", "premises"}:
+            props.extend([p for p in epistemic_context.get("premises", []) or [] if isinstance(p, dict)])
+        if kind in {"all", "targets"}:
+            targets = epistemic_context.get("targets")
+            if targets is None:
+                targets = epistemic_context.get("propositions", [])
+            props.extend([p for p in targets or [] if isinstance(p, dict)])
+        return props
+
+    def _detect_operational_premise_use(
+        self,
+        func_name: str,
+        func_args: Dict[str, Any],
+        epistemic_context: Dict[str, Any],
+        action_role: str,
+    ) -> List[Dict[str, Any]]:
+        """Detect when a concrete entity is used as input to a downstream relation query."""
+        if func_name in {"read_chunk", "read_chunks"}:
+            return []
+        query = self._query_from_tool_args(func_name, func_args).lower()
+        downstream_markers = {
+            "created": "created_date",
+            "creation": "created_date",
+            "founded": "founded_date",
+            "established": "established_date",
+            "abolished": "abolished_date",
+            "abolition": "abolished_date",
+            "dissolved": "abolished_date",
+            "date": "answer_date",
+        }
+        detected_predicate = next((pred for marker, pred in downstream_markers.items() if marker in query), None)
+        if not detected_predicate:
+            return []
+        existing = self._epistemic_props(epistemic_context, "premises")
+        seen = {(str(p.get("subject", "")).lower(), str(p.get("predicate", "")).lower(), str(p.get("object", "")).lower()) for p in existing}
+        operational: List[Dict[str, Any]] = []
+        for prop in self._epistemic_props(epistemic_context, "targets"):
+            subject = str(prop.get("subject") or "").strip()
+            obj = str(prop.get("object") or "").strip()
+            pred = str(prop.get("predicate") or "").lower()
+            concrete_subject = subject and subject.lower() not in {"unknown", "target_entity", "answer"}
+            target_unknown = obj.lower() in {"", "unknown", "unknown location", "answer"}
+            relation_query_for_subject = concrete_subject and subject.lower() in query and (target_unknown or pred in downstream_markers.values())
+            if not relation_query_for_subject:
+                continue
+            premise = {
+                "subject": "target_entity",
+                "predicate": "binding",
+                "object": subject,
+                "relation_id": prop.get("relation_id"),
+                "stance": "COMMITTED",
+                "supporting_evidence_ids": prop.get("supporting_evidence_ids", []) or [],
+                "missing_constraint_ids": prop.get("missing_constraint_ids", []) or [prop.get("relation_id") or "required_relation_grounding"],
+                "operational_detector": "downstream_relation_input_slot",
+                "downstream_predicate": detected_predicate,
+                "source_action_role": action_role,
+            }
+            key = (premise["subject"].lower(), premise["predicate"].lower(), premise["object"].lower())
+            if key not in seen:
+                operational.append(premise)
+                seen.add(key)
+        return operational
+
+    def _trace_epistemic_context(
+        self,
+        trace_logger: Any,
+        decision_id: str,
+        epistemic_context: Dict[str, Any],
+        action_role: str,
+        visible_span_ids: List[str],
+        authoritative: bool,
+    ) -> List[str]:
+        if not trace_logger or not decision_id:
+            return []
+        state_ids = []
+        role_state = {
+            "EXPLORE": "HYPOTHESIS",
+            "TEST": "UNDER_TEST",
+            "VERIFY": "UNDER_TEST",
+            "DISAMBIGUATE": "UNDER_TEST",
+            "COMMIT": "COMMITTED",
+            "USE_AS_PREMISE": "USED_AS_PREMISE",
+        }.get(action_role, "HYPOTHESIS")
+        premise_keys = {id(p) for p in self._epistemic_props(epistemic_context or {}, "premises")}
+        for prop in self._epistemic_props(epistemic_context or {}, "all"):
+            if not isinstance(prop, dict):
+                continue
+            is_premise = id(prop) in premise_keys
+            proposition_id = trace_logger.add_proposition_node(prop)
+            support_ids = list(dict.fromkeys(prop.get("supporting_evidence_ids") or []))
+            available_ids = list(dict.fromkeys(visible_span_ids + support_ids))
+            missing = list(prop.get("missing_constraint_ids") or [])
+            stance = str(prop.get("stance") or role_state).upper()
+            new_state = "USED_AS_PREMISE" if is_premise else ("COMMITTED" if stance == "COMMITTED" else ("USED_AS_PREMISE" if action_role == "USE_AS_PREMISE" else role_state))
+            support_score = min(1.0, len(support_ids) / max(len(missing) + len(support_ids), 1))
+            state_ids.append(trace_logger.add_epistemic_state_event(
+                proposition_id,
+                new_state,
+                generated_by_decision_id=decision_id,
+                available_evidence_ids=available_ids,
+                support_score_at_event=support_score,
+                missing_constraint_ids=missing,
+                authoritative=authoritative,
+                extractor_mode=prop.get("operational_detector") or ("explicit" if authoritative else "inferred"),
+                action_role="USE_AS_PREMISE" if is_premise else action_role,
+            ))
+        return state_ids
+
+    @staticmethod
+    def _assess_span_against_proposition(prop: Dict[str, Any], spans: List[Dict[str, Any]]) -> Dict[str, Any]:
+        text = " ".join(str(s.get("text", "")) for s in spans if isinstance(s, dict)).lower()
+        subject = str(prop.get("subject") or "").lower()
+        predicate = str(prop.get("predicate") or "").lower().replace("_", " ")
+        obj = str(prop.get("object") or "").lower()
+        def toks(value: str) -> List[str]:
+            return [t for t in re.findall(r"[a-z0-9]+", value or "") if len(t) > 2 and t not in {"the", "and", "unknown", "answer"}]
+        pred_synonyms = {
+            "located in": {"located", "location", "in", "near", "off", "coast", "island", "islands", "region"},
+            "location": {"located", "location", "in", "near", "off", "coast", "island", "islands", "region"},
+            "birthplace": {"born", "birth", "birthplace", "native"},
+            "created date": {"created", "creation", "founded", "established", "date"},
+            "abolished date": {"abolished", "abolition", "dissolved", "date"},
+            "established date": {"established", "founded", "created", "date"},
+        }
+        subject_tokens = toks(subject)
+        object_tokens = toks(obj)
+        pred_terms = set(toks(predicate))
+        for key, vals in pred_synonyms.items():
+            if key in predicate:
+                pred_terms.update(vals)
+        subject_match = bool(subject and (subject in text or (subject_tokens and sum(1 for t in subject_tokens if t in text) >= max(1, min(2, len(subject_tokens))))))
+        predicate_match = bool(pred_terms and any(t in text for t in pred_terms))
+        object_match = bool(obj and (obj in text or (object_tokens and sum(1 for t in object_tokens if t in text) >= max(1, min(2, len(object_tokens))))))
+        if obj in {"", "?", "unknown", "unknown location"}:
+            object_match = False
+        provenance_valid = bool(spans)
+        negation_scope = any(marker in text for marker in ["not ", "no evidence", "cannot confirm", "unclear", "alleged", "possibly", "may be"])
+        entailed = subject_match and predicate_match and object_match and provenance_valid and not negation_scope
+        contradicted = bool(subject_match and object_match and any(marker in text for marker in ["not ", "never", "incorrect", "false"]))
+        return {
+            "status": "CONTRADICTED" if contradicted else ("SUPPORTED" if entailed else "INSUFFICIENT"),
+            "subject_match": subject_match,
+            "predicate_match": predicate_match,
+            "object_match": object_match,
+            "provenance_valid": provenance_valid,
+            "entailment": 1.0 if entailed else 0.0,
+            "contradiction": 1.0 if contradicted else 0.0,
+            "insufficient": 0.0 if entailed else 1.0,
+            "assessment_mode": "relation_specific_heuristic",
+        }
+
+    def _trace_evidence_assessments(
+        self,
+        trace_logger: Any,
+        decision_id: str,
+        epistemic_context: Dict[str, Any],
+        delivered_span_ids: List[str],
+        tool_result_payload: Dict[str, Any],
+    ):
+        if not trace_logger or not decision_id or not isinstance(epistemic_context, dict):
+            return
+        span_by_id = {}
+        if isinstance(tool_result_payload, dict):
+            for item in tool_result_payload.get("results", []) or []:
+                if not isinstance(item, dict):
+                    continue
+                for span in item.get("matched_spans", []) or []:
+                    if isinstance(span, dict) and span.get("span_id"):
+                        span_by_id[span["span_id"]] = span
+        spans = [span_by_id[sid] for sid in delivered_span_ids if sid in span_by_id]
+        for prop in self._epistemic_props(epistemic_context, "targets"):
+            if not isinstance(prop, dict):
+                continue
+            proposition_id = trace_logger.add_proposition_node(prop)
+            assessment = self._assess_span_against_proposition(prop, spans)
+            trace_logger.add_evidence_assessment(proposition_id, decision_id, delivered_span_ids, assessment)
+            if assessment["status"] in {"SUPPORTED", "CONTRADICTED"}:
+                trace_logger.add_epistemic_state_event(
+                    proposition_id,
+                    "SUPPORTED" if assessment["status"] == "SUPPORTED" else "REJECTED",
+                    generated_by_decision_id=decision_id,
+                    available_evidence_ids=delivered_span_ids,
+                    support_score_at_event=float(assessment.get("entailment", 0.0) or 0.0),
+                    missing_constraint_ids=[] if assessment["status"] == "SUPPORTED" else ["contradicted_by_evidence"],
+                    authoritative=bool((epistemic_context or {}).get("explicit")),
+                    extractor_mode="relation_specific_evidence_assessment",
+                    action_role="VERIFY",
+                )
+
     def _trace_answer(
         self,
         trace_logger: Any,
@@ -301,7 +582,44 @@ class BaseAgent:
     ) -> str:
         if trace_logger is None:
             return None
-
+        try:
+            visible_span_ids = []
+            premise_ids = []
+            for state in getattr(trace_logger, "nodes", []):
+                if state.get("type") != "epistemic_state_event":
+                    continue
+                md = state.get("metadata", {}) or {}
+                if md.get("new_state") in {"COMMITTED", "USED_AS_PREMISE"} and md.get("authoritative"):
+                    pid = md.get("proposition_id")
+                    if pid:
+                        premise_ids.append(pid)
+            premise_ids = list(dict.fromkeys(premise_ids))
+            answer_lower = (final_answer or "").lower()
+            abstained = any(p in answer_lower for p in ["cannot answer", "not found", "no information", "unable to find", "cannot confirm"])
+            decision_id = trace_logger.add_decision_record(analysis_node, {
+                "decision_type": "abstention_decision" if abstained else "answer_decision",
+                "active_subgoal_ids": [],
+                "premise_proposition_ids": premise_ids,
+                "available_evidence_ids": visible_span_ids,
+                "conclusion": final_answer,
+                "action_role": "USE_AS_PREMISE" if premise_ids else "COMMIT",
+                "query_or_action": "final_answer",
+                "public_reason_code": "final_public_answer",
+                "confidence": 0.5,
+                "authoritative": True,
+                "extractor_mode": "online_final_decision",
+                "termination_reason": reason or ("abstention" if abstained else "submit_answer"),
+            })
+            if premise_ids:
+                for node in getattr(trace_logger, "nodes", []):
+                    if node.get("type") == "epistemic_state_event" and node.get("metadata", {}).get("new_state") in {"COMMITTED", "USED_AS_PREMISE"}:
+                        trace_logger.link_state_event_to_decision(node["id"], decision_id)
+            else:
+                trace_logger.metadata.setdefault("root_identification_blocking_reasons", [])
+                if "ANSWER_DECISION_WITHOUT_EXPLICIT_PREMISES" not in trace_logger.metadata["root_identification_blocking_reasons"]:
+                    trace_logger.metadata["root_identification_blocking_reasons"].append("ANSWER_DECISION_WITHOUT_EXPLICIT_PREMISES")
+        except Exception:
+            pass
         return trace_logger.add_answer(analysis_node, final_answer, loop_count,
                                        reason or "final_answer", evidence_nodes)
 
@@ -551,6 +869,40 @@ class BaseAgent:
                 except json.JSONDecodeError as exc:
                     func_args = {}
                     arguments_parse_error = str(exc)
+                epistemic_context = func_args.pop("epistemic_context", None) if isinstance(func_args, dict) else None
+                if not isinstance(epistemic_context, dict) or not epistemic_context:
+                    if trace_logger:
+                        trace_logger.metadata["root_identification_capable"] = False
+                        trace_logger.metadata.setdefault("root_identification_blocking_reasons", [])
+                        if "MISSING_EXPLICIT_EPISTEMIC_CONTEXT" not in trace_logger.metadata["root_identification_blocking_reasons"]:
+                            trace_logger.metadata["root_identification_blocking_reasons"].append("MISSING_EXPLICIT_EPISTEMIC_CONTEXT")
+                        trace_logger.metadata["missing_epistemic_context_count"] = trace_logger.metadata.get("missing_epistemic_context_count", 0) + 1
+                    query_text_for_context = self._query_from_tool_args(func_name, func_args)
+                    epistemic_context = {
+                        "explicit": False,
+                        "active_subgoal_ids": [],
+                        "action_role": "TEST" if func_name not in {"read_chunk", "read_chunks"} else "VERIFY",
+                        "propositions": [{
+                            "subject": query_text_for_context,
+                            "predicate": "query_about",
+                            "object": "",
+                            "relation_id": None,
+                            "stance": "HYPOTHESIS",
+                            "supporting_evidence_ids": [],
+                            "missing_constraint_ids": ["relation_specific_support"],
+                            "extractor_mode": "inferred",
+                        }],
+                    }
+                else:
+                    if not self._epistemic_props(epistemic_context, "all"):
+                        if trace_logger:
+                            trace_logger.metadata["root_identification_capable"] = False
+                            trace_logger.metadata.setdefault("root_identification_blocking_reasons", [])
+                            if "EPISTEMIC_CONTEXT_WITHOUT_PROPOSITIONS" not in trace_logger.metadata["root_identification_blocking_reasons"]:
+                                trace_logger.metadata["root_identification_blocking_reasons"].append("EPISTEMIC_CONTEXT_WITHOUT_PROPOSITIONS")
+                    epistemic_context = {**epistemic_context, "explicit": True}
+                    if trace_logger:
+                        trace_logger.metadata.setdefault("root_identification_capable", True)
 
                 if self.verbose:
                     print(f"Tool: {func_name}")
@@ -558,6 +910,22 @@ class BaseAgent:
 
                 search_history_start = len(context.search_history)
                 read_chunk_ids_start = set(context.read_chunk_ids)
+                call_order = len([n for n in getattr(trace_logger, "nodes", []) if n["type"] == "plan_query"]) + 1 if trace_logger else 1
+                visible_span_ids = []
+                for delivery in context.context_deliveries:
+                    visible_span_ids.extend(delivery.get("span_ids", []) or [])
+                decision_node = self._trace_decision_record(
+                    trace_logger,
+                    analysis_node,
+                    input_context_node,
+                    func_name,
+                    func_args,
+                    epistemic_context,
+                    loop_count,
+                    call_order,
+                    tc.get("id"),
+                    list(dict.fromkeys(visible_span_ids)),
+                )
 
                 try:
                     tool_result, tool_log = self.tools.execute(func_name, context, **func_args)
@@ -568,6 +936,7 @@ class BaseAgent:
                 new_evidence_nodes = self._trace_tool_evidence(
                     trace_logger,
                     analysis_node,
+                    decision_node,
                     func_name,
                     func_args,
                     tool_result,
@@ -608,6 +977,13 @@ class BaseAgent:
                     span_ids=delivered_span_ids,
                     text=tool_result,
                     metadata={"tool_name": func_name, "tool_status": tool_log.get("status")},
+                )
+                self._trace_evidence_assessments(
+                    trace_logger,
+                    decision_node,
+                    epistemic_context or {},
+                    list(dict.fromkeys(delivered_span_ids)),
+                    tool_result_payload or {},
                 )
                 messages.append({
                     "role": "tool",

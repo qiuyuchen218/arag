@@ -6,7 +6,7 @@ import re
 from collections import Counter
 from typing import Any, Dict, List, Tuple, TYPE_CHECKING
 
-from arag.core.schemas import EvidenceSpan, SearchHit, ToolResult, artifact_id, result_dict, stable_hash
+from arag.core.schemas import EvidenceSpan, SearchHit, ToolResult, artifact_id, content_fingerprint, result_dict, stable_hash
 from arag.tools.base import BaseTool
 
 if TYPE_CHECKING:
@@ -25,7 +25,10 @@ class KeywordSearchTool(BaseTool):
     def __init__(self, chunks_file: str):
         self.chunks_file = chunks_file
         self.chunks = self._load_chunks()
-        self.corpus_version = stable_hash(chunks_file, len(self.chunks))
+        self.corpus_version = content_fingerprint({
+            "chunks_file": chunks_file,
+            "chunks": self.chunks,
+        })
         self._prepare_index()
 
         if not HAS_TIKTOKEN:
@@ -157,9 +160,43 @@ RETURNS: Abbreviated snippets marked with "..." showing where keywords appear. T
                             "type": "integer",
                             "description": "Number of top-ranked chunks to return (default: 5, max: 20)",
                             "default": 5
+                        },
+                        "epistemic_context": {
+                            "type": "object",
+                            "description": "Required public decision context. Include at least one proposition that this retrieval is exploring, testing, verifying, committing, or using as a premise.",
+                            "properties": {
+                                "action_role": {
+                                    "type": "string",
+                                    "enum": ["EXPLORE", "TEST", "VERIFY", "DISAMBIGUATE", "USE_AS_PREMISE", "COMMIT"]
+                                },
+                                "active_subgoal_ids": {"type": "array", "items": {"type": "string"}},
+                                "purpose": {"type": "string"},
+                                "propositions": {
+                                    "type": "array",
+                                    "minItems": 1,
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "subject": {"type": "string"},
+                                            "predicate": {"type": "string"},
+                                            "object": {"type": "string"},
+                                            "relation_id": {"type": "string"},
+                                            "stance": {
+                                                "type": "string",
+                                                "enum": ["HYPOTHESIS", "PARTIALLY_SUPPORTED", "COMMITTED"]
+                                            },
+                                            "supporting_evidence_ids": {"type": "array", "items": {"type": "string"}},
+                                            "missing_constraint_ids": {"type": "array", "items": {"type": "string"}}
+                                        },
+                                        "required": ["subject", "predicate", "object", "stance"]
+                                    }
+                                }
+                            },
+                            "required": ["action_role", "active_subgoal_ids", "purpose", "propositions"],
+                            "additionalProperties": True
                         }
                     },
-                    "required": ["keywords"]
+                    "required": ["keywords", "epistemic_context"]
                 }
             }
         }

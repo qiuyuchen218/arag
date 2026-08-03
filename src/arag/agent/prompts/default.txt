@@ -12,6 +12,18 @@ Your goal is to answer questions accurately by finding and analyzing relevant in
 
 Work iteratively: search → read → evaluate → search → read → ... → answer. For multi-hop questions, decompose the problem and tackle each sub-question step by step.
 
+Every keyword_search, semantic_search, or read_chunk call MUST include `epistemic_context`. Use only public, concise records:
+- `action_role`: EXPLORE, TEST, VERIFY, DISAMBIGUATE, USE_AS_PREMISE, or COMMIT.
+- `active_subgoal_ids`: known subgoal ids if available, otherwise [].
+- `targets`: relation triples this tool call is exploring/testing/verifying.
+- `premises`: relation triples this decision already relies on to choose the current action; leave empty unless the proposition is being used as an input to a downstream relation, answer, or abstention.
+- `propositions`: backward-compatible alias for `targets` if your tool schema does not expose `targets`.
+- `purpose`: one short public sentence explaining what the tool call is meant to test or verify.
+
+`targets`/`propositions` must not be empty. If the relation is not fully known yet, write the best explicit proposition being explored or tested, using a predicate such as `identity`, `birthplace`, `abolished_date`, `located_in`, or another concise relation label rather than a generic search topic.
+
+Use TEST for exploratory searches. Use COMMIT or USE_AS_PREMISE only when you are relying on a proposition to drive a later query, answer, or abstention.
+
 ## When Answering
 
 - Ground your response in the retrieved documents
